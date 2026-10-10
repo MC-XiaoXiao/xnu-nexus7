@@ -101,8 +101,12 @@ mmu_reinitialize:
     /* Load memory size value after fixup. */
     ldr     r12, [r0, BOOT_ARGS_MEMSIZE]
 
-    /* MMU cacheability value. */
+    /* ARMv7 page-table walks use Normal inner/outer Write-Back. */
+#ifdef _ARM_ARCH_7
+    orr     r5, r4, #0x48
+#else
     orr     r5, r4, #0x18
+#endif
 
     /* Now, we have to set our TTB to this value. */
     mcr     p15, 0, r5, c2, c0, 0
@@ -169,8 +173,17 @@ leo_identity_smi:
 
     /* Start MMU. */
     mrc     p15, 0, r3, c1, c0, 0
+#ifdef _ARM_ARCH_7
+    /* These tables encode TEX/C/B and AP directly, without PRRR/NMRR. */
+    bic     r3, r3, #(1 << 28)
+    bic     r3, r3, #(1 << 29)
+    dsb     sy
+#endif
     orr     r3, r3, #1
     mcr     p15, 0, r3, c1, c0, 0
+#ifdef _ARM_ARCH_7
+    isb     sy
+#endif
 
     /*
      * Hopefully, if we got here, things are looking good and we
@@ -234,10 +247,19 @@ mmu_initialized:
     mov     r7, #0
 
 #if __ARM_PROCESSOR_CLASS_CORTEX_A9__
-    /* Enable automatic-clock gating. */
+    /* Cortex-A9 implementation-defined power control, not a board setting.
+     * Check MIDR as well: a platform name must not authorize CP15 c15 access
+     * on another implementation (for example Qualcomm Scorpion/Krait). */
+    mrc     p15, 0, r4, c0, c0, 0
+    ubfx    r4, r4, #4, #12
+    movw    r5, #0xc09
+    cmp     r4, r5
+    bne     .Lnot_cortex_a9
     mrc     p15, 0, r4, c15, c0, 0
     orr     r4, r4, #1
     mcr     p15, 0, r4, c15, c0, 0
+    isb     sy
+.Lnot_cortex_a9:
 #endif
 
     /* Enable unaligned memory access and caching */
@@ -246,7 +268,30 @@ mmu_initialized:
     bic     r4, r4, #(1 << 1)
     orr     r4, r4, #(1 << 23)  /* Unaligned memory access */
     orr     r4, r4, #(1 << 12)  /* Enable I-cache */
+#ifdef _ARM_ARCH_7
+    /* Generic ARMv7 entry contract: the loader supplies clean caches and
+     * Normal cacheable RAM. Atomics in the first C lock initializers must
+     * not depend on the loader having left the data cache enabled. */
+    orr     r4, r4, #(1 << 2)
+    orr     r4, r4, #(1 << 11)
+    dsb     sy
+#endif
     mcr     p15, 0, r4, c1, c0, 0
+#ifdef _ARM_ARCH_7
+    isb     sy
+    /* Architectural VFP access; CPU-specific feature discovery and context
+     * initialization still run through init_vfp(). No Apple c15 controls. */
+    mrc     p15, 0, r4, c1, c0, 2
+    orr     r4, r4, #(0xf << 20)
+    bic     r4, r4, #(1 << 30)
+    bic     r4, r4, #(1 << 31)
+    mcr     p15, 0, r4, c1, c0, 2
+    isb     sy
+    mov     r4, #(1 << 30)
+    vmsr    fpexc, r4
+    mov     r4, #0
+    vmsr    fpscr, r4
+#endif
 
     /* Invalid Data/Inst TLB */
     mov     r4, #0

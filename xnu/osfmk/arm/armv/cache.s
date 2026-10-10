@@ -33,6 +33,7 @@
 #include <platforms.h>
 #include <arm/arch.h>
 #include <arm/asm_help.h>
+#include <arm/PlatformConfigs.h>
 
 /**
  * invalidate_dcache
@@ -186,17 +187,15 @@ EnterARM(cache_initialize)
     mcr     p15, 0, r0, c7, c10, 4
 #endif
 
-    /* Enable L2 cache */
-#if defined(_ARM_ARCH_7) && !defined(BOARD_CONFIG_QSD8250_LEO)
+    /* Cortex-A9 ACTLR bit 1 enables L2 prefetch, not the external L2
+     * controller. External cache/SCU ownership belongs to the platform.
+     * Other ARMv7 implementations must not inherit this CP15 policy. */
+#if defined(_ARM_ARCH_7) && __ARM_PROCESSOR_CLASS_CORTEX_A9__
     mrc     p15, 0, r0, c1, c0, 1
     orr     r0, r0, #(1 << 1)
 
-#ifdef BOARD_CONFIG_MSM8960_TOUCHPAD
-    /*
-     * Cortex-A9 specific.....? God knows what is in the TouchPad.
-     * Fuck Qualcomm and their stupid closed SoCs and their stupid
-     * implementational differences.
-     */
+#if __ARM_PROCESSOR_CLASS_QUALCOMM_A9__
+    /* Preserve the legacy Qualcomm CPU profile's coherency setup. */
     orr     r0, r0, #(1 << 6)   /* Cache Coherency (Cortex-A9 SMP) */
     orr     r0, r0, #(1 << 2)   /* L1 D-Cache Prefetch (Dside) */
 #endif

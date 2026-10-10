@@ -124,6 +124,15 @@ void arm_init(boot_args * args)
     PE_early_puts("arm_init: calling thread_bootstrap\n");
     thread_bootstrap();
 
+    /* Boot arguments precede lock options; lock groups and timer-call state
+     * precede cpu_init's per-CPU queue. This is the ordering used by the
+     * reference ARM kernel, rather than initializing these after VM setup. */
+    PE_early_puts("arm_init: calling PE_init_platform (early)\n");
+    PE_init_platform(FALSE, (void *) args);
+    PE_init_kprintf(FALSE);
+    PE_early_puts("arm_init: calling kernel_early_bootstrap\n");
+    kernel_early_bootstrap();
+
     /*
      * CPU initialization. 
      */
@@ -138,17 +147,6 @@ void arm_init(boot_args * args)
      */
     PE_early_puts("arm_init: calling processor_bootstrap\n");
     processor_bootstrap();
-
-    /*
-     * Initialize the ARM platform expert. 
-     */
-    PE_early_puts("arm_init: calling PE_init_platform\n");
-    PE_init_platform(FALSE, (void *) args);
-
-    /*
-     * Initialize kprintf, but no VM is running yet. 
-     */
-    PE_init_kprintf(FALSE);
 
     /*
      * Set maximum memory size based on boot-args. 
@@ -172,9 +170,9 @@ void arm_init(boot_args * args)
     arm_vm_init(maxMem, args);
 
     /*
-     * Kernel early bootstrap. 
+     * Lock/timer bootstrap already ran before cpu_init.
      */
-    kernel_early_bootstrap();
+    PE_early_puts("arm_init: VM bootstrap complete\n");
 
     /*
      * PE platform init. 

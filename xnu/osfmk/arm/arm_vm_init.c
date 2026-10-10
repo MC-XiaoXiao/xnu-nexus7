@@ -51,6 +51,7 @@
 #include <arm/misc_protos.h>
 #include <arm/low_globals.h>
 #include <arm/arch.h>
+#include <arm/PlatformConfigs.h>
 
 #define align_down(p, s)        ((uintptr_t)(p)&~(s-1))
 #define align_up(p, s)          align_down((uintptr_t)(p)+s-1, s)
@@ -194,8 +195,14 @@ void l2_map_linear_range(uint32_t pa_cache_start, uint32_t phys_start,
         *ptv |= L2_SMALL_PAGE;
         *ptv |= L2_ACCESS_PRW;
 
-        /* Writethrough, no write allocate. */
+        /* Cortex-A9 treats Write-Through as non-cacheable, preventing
+         * exclusive stores to kernel locks. Match the Write-Back bootstrap
+         * sections; use the descriptor encoder, including TEX bits. */
+#if __ARM_PROCESSOR_CLASS_CORTEX_A9__
+        *ptv |= mmu_texcb_small(MMU_DATA);
+#else
         *ptv |= (MMU_TEXCB_CA_WT_NWA << 2);
+#endif
 
         pte_iter += sizeof(unsigned int);
         phys_iter += PAGE_SIZE;
@@ -389,6 +396,9 @@ void arm_vm_init(uint32_t mem_limit, boot_args * args)
 #else
     *va_vecpt =
         virt_to_phys(&HighExceptionVectorsBase) | L2_ACCESS_PRW | L2_SMALL_PAGE;
+#if __ARM_PROCESSOR_CLASS_CORTEX_A9__
+    *va_vecpt |= mmu_texcb_small(MMU_DATA);
+#endif
 #endif
 
     /*
@@ -405,6 +415,12 @@ void arm_vm_init(uint32_t mem_limit, boot_args * args)
      * Clean caches and flush TLBs.. 
      */
     kdb_printf("arm_vm_init: switching translation-tables now...\n");
+#ifdef _ARM_ARCH_7
+    /* Publish dirty L1/L2 descriptors before the hardware walker can use
+     * the new tables. Also remove old cache lines before changing RAM's
+     * cache policy. A TLB invalidation alone does neither operation. */
+    cleanflush_dcache();
+#endif
     set_mmu_ttb(cpu_ttb);
     set_mmu_ttb_alt(cpu_ttb);
     set_mmu_ttbcr(2);
