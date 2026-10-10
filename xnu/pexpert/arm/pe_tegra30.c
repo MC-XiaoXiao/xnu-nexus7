@@ -189,7 +189,16 @@ static void tegra_handle_interrupt(void *context)
     REG(gicc_base, 0x10) = ack; /* Preserve the complete acknowledge token. */
     io_sync();
 }
-static void tegra_framebuffer_init(void) { /* Serial-only bring-up. */ }
+static void tegra_framebuffer_init(void)
+{
+    if (PE_state.video.v_baseAddr) {
+        kprintf("Tegra30 framebuffer: %ux%u, depth %u, stride %u, PA 0x%lx\n",
+            (unsigned)PE_state.video.v_width, (unsigned)PE_state.video.v_height,
+            (unsigned)PE_state.video.v_depth, (unsigned)PE_state.video.v_rowBytes,
+            PE_state.video.v_baseAddr & ~3UL);
+    }
+    initialize_screen(&PE_state.video, kPETextMode);
+}
 void PE_init_SocSupport_stub(void)
 {
     gPESocDispatch.uart_getc = tegra_getc;

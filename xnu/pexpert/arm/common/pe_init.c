@@ -115,7 +115,8 @@ void PE_init_platform(boolean_t vm_initialized, void *_args)
         PE_state.bootArgs = _args;
         PE_state.deviceTreeHead = args->deviceTreeP;
 
-        PE_state.video.v_baseAddr = args->Video.v_baseAddr;
+        /* initialize_screen uses bit 0 to distinguish a physical address. */
+        PE_state.video.v_baseAddr = args->Video.v_baseAddr ? args->Video.v_baseAddr | 1UL : 0;
         PE_state.video.v_rowBytes = args->Video.v_rowBytes;
         PE_state.video.v_width = args->Video.v_width;
         PE_state.video.v_height = args->Video.v_height;
@@ -269,6 +270,9 @@ void PE_init_iokit(void)
 
     kprintf("PE_init_iokit: starting IOKit now!\n");
 
+#if defined(BOARD_CONFIG_TEGRA30_NEXUS7)
+    gPESocDispatch.framebuffer_init();
+#endif
     PE_init_printf(TRUE);
 
     StartIOKit(PE_state.deviceTreeHead, PE_state.bootArgs, (void *) 0, (void *) 0);

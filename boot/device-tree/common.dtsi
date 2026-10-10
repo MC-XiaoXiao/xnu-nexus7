@@ -9,6 +9,7 @@
             Kernel = <0x0 0x0>;
             BootArgs = <0x0 0x0>;
             DeviceTree = <0x0 0x0>;
+            Framebuffer = <0x0 0x0>;
         };
     };
     /* Optional early boot overrides; missing properties use kernel defaults. */
