@@ -506,6 +506,8 @@ static UInt32 IODTMapOneInterrupt( IORegistryEntry * regEntry, UInt32 * intSpec,
     bool			cmp, ok = false;
 
     parent = IODTFindInterruptParent( regEntry, index );    
+    if( !parent)
+        return( 0 );
     IODTGetICellCounts( parent, &icells, &acells );
     addrCmp = 0;
     if( acells) {
@@ -596,6 +598,10 @@ static UInt32 IODTMapOneInterrupt( IORegistryEntry * regEntry, UInt32 * intSpec,
             } while( !cmp && (map < endMap) );
             if (!cmp)
                 parent = 0;
+        } else {
+            // No controller or map can consume this interrupt. Retrying the
+            // same parent never makes progress and stalls all IOKit startup.
+            parent = 0;
         } 
 
         if( parent) {

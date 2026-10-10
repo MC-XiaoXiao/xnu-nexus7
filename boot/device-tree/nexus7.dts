@@ -23,10 +23,16 @@
         timer {
             compatible = "nvidia,tegra30-timer";
             reg = <0x60005000 0x1000>;
+            interrupt-parent = <&gic>;
             interrupts = <0x20>;
         };
-        interrupt-controller {
+        gic: interrupt-controller {
             compatible = "arm,cortex-a9-gic";
+            /* Apple dtc generates AAPL,phandle for the label reference.
+             * The platform uses one cell containing the absolute GIC ID. */
+            interrupt-controller;
+            #interrupt-cells = <0x1>;
+            #address-cells = <0x0>;
             reg = <0x50041000 0x1000 0x50040100 0x100>;
         };
         legacy-interrupt-controller {

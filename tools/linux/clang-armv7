@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-import os, sys
+import os, sys, subprocess, tempfile
+from pathlib import Path
 args = sys.argv[1:]
 out = []
 lang = ['-std=gnu++98'] if any(a.endswith(('.cpp', '.cc', '.cxx')) for a in args) else ['-std=gnu99']
@@ -14,4 +15,33 @@ while i < len(args):
         continue
     out.append(a.replace('-Werror', '-Wno-error') if a.startswith('-Werror') else a)
     i += 1
-os.execvp('clang', ['clang', '-target', 'armv7-apple-darwin11', '-Wno-error', '-Wno-implicit-function-declaration', '-Wno-int-conversion', '-Wno-incompatible-pointer-types', '-Wno-deprecated-non-prototype'] + lang + out)
+command = ['clang', '-target', 'armv7-apple-darwin11', '-Wno-error', '-Wno-implicit-function-declaration', '-Wno-int-conversion', '-Wno-incompatible-pointer-types', '-Wno-deprecated-non-prototype'] + lang
+
+# Clang 23's Thumb stack-protector lowering can emit a narrow literal LDR
+# with r9 as its destination. Direct object emission silently encodes r1,
+# corrupting an argument and then dereferencing an uninitialized r9 in
+# OSKextVLog. Parsing textual assembly widens that LDR correctly. Keep the
+# stack protector and optimization settings; never patch instruction bytes.
+sources = [a for a in out if a.endswith(('.c', '.cpp', '.cc', '.cxx'))]
+if '-c' in out and sources and '-E' not in out and '-S' not in out:
+    output_index = out.index('-o') + 1 if '-o' in out else None
+    output = out[output_index] if output_index is not None else Path(sources[-1]).stem + '.o'
+    with tempfile.TemporaryDirectory(prefix='nexus7-clang-') as directory:
+        assembly = str(Path(directory) / 'kernel.s')
+        compile_args = list(out)
+        compile_args[compile_args.index('-c')] = '-S'
+        if output_index is not None:
+            compile_args[output_index] = assembly
+        else:
+            compile_args += ['-o', assembly]
+        # Preserve dependency filenames and targets despite the temporary -o.
+        if '-MD' in out or '-MMD' in out:
+            if '-MF' not in out:
+                compile_args += ['-MF', str(Path(output).with_suffix('.d'))]
+            if '-MT' not in out and '-MQ' not in out:
+                compile_args += ['-MQ', output]
+        subprocess.run(command + compile_args, check=True)
+        subprocess.run(['clang', '-target', 'armv7-apple-darwin11',
+                        '-x', 'assembler', '-c', assembly, '-o', output], check=True)
+    sys.exit(0)
+os.execvp(command[0], command + out)

@@ -27,6 +27,11 @@ target="$obj/DEVELOPMENT_ARM_TEGRA30_NEXUS7"
 # differently configured objects; selecting a fresh OBJROOT is non-destructive.
 mkdir -p "$obj"
 signature="$obj/nexus7-uart.txt"
+compiler_signature="$obj/nexus7-compiler.sha256"
+compiler_hash=$(sha256sum "$helpers/clang-armv7" | cut -d ' ' -f 1)
+if [[ -d "$target" ]] && { [[ ! -f "$compiler_signature" ]] || [[ $(cat "$compiler_signature") != "$compiler_hash" ]]; }; then
+    echo 'Compiler wrapper changed or is unknown: choose a fresh NEXUS7_OBJROOT to rebuild all objects' >&2; exit 1
+fi
 if [[ -f "$signature" ]]; then
     [[ $(cat "$signature") == "$uart" ]] || {
         echo 'UART changed: choose a fresh NEXUS7_OBJROOT to rebuild all objects' >&2; exit 1;
@@ -35,6 +40,7 @@ elif [[ -d "$target" ]]; then
     echo 'Existing OBJROOT has no UART signature: choose a fresh NEXUS7_OBJROOT' >&2; exit 1
 fi
 printf '%s\n' "$uart" > "$signature"
+printf '%s\n' "$compiler_hash" > "$compiler_signature"
 
 export PATH="$deps/deps/tcsh/usr/bin:$helpers:$PATH"
 # doconf is an upstream tcsh script with an absolute /bin/tcsh shebang.
