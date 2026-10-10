@@ -1,0 +1,18 @@
+--- AppleDeviceTree.c
++++ AppleDeviceTree.c
+@@ -11,2 +11,4 @@
+ #define kPropNameLength 32
+ 
++#include <stdint.h>
++
+@@ -13,3 +15,3 @@
+ typedef struct DeviceTreeNodeProperty {
+     char                name[kPropNameLength];  // NUL terminated property name
+-    unsigned long       length;         // Length (bytes) of folloing prop value
++    uint32_t            length;         // Length (bytes) of following prop value
+@@ -20,3 +22,3 @@
+ typedef struct OpaqueDTEntry {
+-    unsigned long       nProperties;    // Number of props[] elements (0 => end)
+-    unsigned long       nChildren;      // Number of children[] elements
++    uint32_t            nProperties;    // Number of props[] elements (0 => end)
++    uint32_t            nChildren;      // Number of children[] elements

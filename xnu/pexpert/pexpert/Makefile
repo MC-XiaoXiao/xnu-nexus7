@@ -34,7 +34,8 @@ INSTALL_MI_LIST	= ${DATAFILES}
 INSTALL_MI_DIR = pexpert
 
 EXPORT_MI_LIST	= ${DATAFILES} \
-		    device_tree.h
+		    device_tree.h \
+                    apple_dt.h
 
 EXPORT_MI_DIR = pexpert
 

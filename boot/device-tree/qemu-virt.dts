@@ -1,0 +1,18 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/dts-v1/;
+#ifndef XNU_DT_UART
+#define XNU_DT_UART 0x9000000
+#endif
+#include "common.dtsi"
+
+/ {
+    model = "QEMU shim test";
+    compatible = "qemu,virt";
+    arm-io {
+        serial {
+            device_type = "serial";
+            compatible = "arm,pl011";
+            reg = <XNU_DT_UART 0x1000>;
+        };
+    };
+};

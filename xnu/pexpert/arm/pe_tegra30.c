@@ -9,6 +9,7 @@
 #include <pexpert/pexpert.h>
 #include <pexpert/arm/protos.h>
 #include <pexpert/arm/boot.h>
+#include <pexpert/device_tree.h>
 #include <machine/machine_routines.h>
 #include <arm/pmap.h>
 #include <kern/debug.h>
@@ -17,10 +18,7 @@
 #ifndef NEXUS7_UART_PHYS
 #define NEXUS7_UART_PHYS 0x70006300U
 #endif
-#define TIMER_PHYS 0x60005000U
-#define GICD_PHYS  0x50041000U
-#define GICC_PHYS  0x50040100U
-#define LIC_PHYS   0x60004000U
+static uint32_t timer_phys, gicd_phys, gicc_phys, lic_phys, uart_phys;
 #define TIMER_IRQ 32U /* TIMER1 = GIC SPI 0 */
 #define TICK_US 10000U
 #define REG(b, o) (*(volatile uint32_t *)((b) + (o)))
@@ -35,6 +33,46 @@ void tegra30_uart_init(void);
 void tegra30_uart_suspend(void) { uart_transition = TRUE; }
 extern void rtc_configure(uint64_t);
 extern void rtclock_intr(arm_saved_state_t *);
+
+/* Read while the flattened tree still exists. Keep scalar copies because
+ * IODeviceTreeAlloc may release the loader's original blob later. */
+static void dt_cells(const char *path, const char *key, uint32_t *cells, unsigned count)
+{
+    DTEntry entry;
+    void *value;
+    unsigned int size;
+    if (DTLookupEntry(NULL, path, &entry) != kSuccess ||
+        DTGetProperty(entry, key, &value, &size) != kSuccess || size != count*4)
+        panic("Tegra30 DT: missing/invalid %s:%s", path, key);
+    bcopy(value, cells, size);
+}
+void tegra30_dt_init(void)
+{
+    uint32_t reg[4], irq, hz;
+    dt_cells("/arm-io/serial", "reg", reg, 2);
+    /* Early output precedes DT parsing, so its compile-time UART must agree. */
+    if (reg[0] != NEXUS7_UART_PHYS || reg[1] != 0x100)
+        panic("Tegra30 DT: UART differs from early console");
+    uart_phys = reg[0];
+    dt_cells("/arm-io/timer", "reg", reg, 2);
+    if ((reg[0]&0xfff) || reg[1]!=0x1000) panic("Tegra30 DT: invalid timer range");
+    timer_phys = reg[0];
+    dt_cells("/arm-io/timer", "interrupts", &irq, 1);
+    if (irq != TIMER_IRQ) panic("Tegra30 DT: only TIMER1 IRQ is supported");
+    dt_cells("/arm-io/interrupt-controller", "reg", reg, 4);
+    if ((reg[0]&0xfff) || reg[1]!=0x1000 || (reg[2]&0xfff)!=0x100 || reg[3]!=0x100)
+        panic("Tegra30 DT: invalid GIC ranges");
+    gicd_phys = reg[0]; gicc_phys = reg[2];
+    dt_cells("/arm-io/legacy-interrupt-controller", "reg", reg, 2);
+    if ((reg[0]&0xfff) || reg[1]!=0x1000) panic("Tegra30 DT: invalid LIC range");
+    lic_phys = reg[0];
+    dt_cells("/cpus/cpu0", "timebase-frequency", &hz, 1);
+    /* TIMERUS is a 1 MHz counter; a DT change cannot reprogram that clock. */
+    if (hz != 1000000) panic("Tegra30 DT: TIMERUS must run at 1 MHz");
+    gPEClockFrequencyInfo.timebase_frequency_hz = hz;
+    gPEClockFrequencyInfo.dec_clock_rate_hz = hz;
+    PE_early_puts("Tegra30 DT: UART/timer/GIC/LIC/timebase validated\n");
+}
 
 static void io_sync(void) { __asm__ volatile("dsb sy" ::: "memory"); }
 void tegra30_early_putc(char c)
@@ -58,8 +96,8 @@ static int tegra_getc(void)
 void tegra30_uart_init(void)
 {
     if (!uart_base) {
-        vm_offset_t page = ml_io_map(NEXUS7_UART_PHYS & ~0xfffU, 0x1000);
-        uart_base = page + (NEXUS7_UART_PHYS & 0xfffU);
+        vm_offset_t page = ml_io_map(uart_phys & ~0xfffU, 0x1000);
+        uart_base = page + (uart_phys & 0xfffU);
     }
     uart_transition = FALSE;
     for (unsigned int i = 0; i < early_count; ++i) tegra30_early_putc(early_text[i]);
@@ -68,10 +106,10 @@ void tegra30_uart_init(void)
 static void tegra_interrupt_init(void)
 {
     uint32_t i, banks;
-    gicd_base = ml_io_map(GICD_PHYS, 0x1000);
-    gicc_base = ml_io_map(GICC_PHYS & ~0xfffU, 0x1000) + 0x100;
-    lic_base = ml_io_map(LIC_PHYS, 0x1000);
-    timer_base = ml_io_map(TIMER_PHYS, 0x1000);
+    gicd_base = ml_io_map(gicd_phys, 0x1000);
+    gicc_base = ml_io_map(gicc_phys & ~0xfffU, 0x1000) + 0x100;
+    lic_base = ml_io_map(lic_phys, 0x1000);
+    timer_base = ml_io_map(timer_phys, 0x1000);
     REG(gicd_base, 0) = 0;
     REG(gicc_base, 0) = 0;
     banks = (REG(gicd_base, 4) & 31) + 1;

@@ -37,6 +37,7 @@
 #include <pexpert/pexpert.h>
 #include <pexpert/boot.h>
 #include <pexpert/device_tree.h>
+#include <pexpert/apple_dt.h>
 #include <pexpert/pe_images.h>
 #include <kern/sched_prim.h>
 #include <kern/debug.h>
@@ -131,13 +132,32 @@ void PE_init_platform(boolean_t vm_initialized, void *_args)
          * Initialize the device tree crap. 
          */
         PE_early_puts("PE_init_platform: Initializing device tree\n");
+#if defined(BOARD_CONFIG_TEGRA30_NEXUS7)
+        /* locore relocates r0, but deviceTreeP is already a kernel VA. Ensure
+         * the complete blob lies in loader-reserved RAM before walking it. */
+        uint32_t dtva = (uint32_t)(uintptr_t)args->deviceTreeP;
+        uint32_t offset = dtva - args->virtBase;
+        uint32_t reserved = args->topOfKernelData - args->physBase;
+        if (dtva < args->virtBase || (dtva & 0xfff) ||
+            args->topOfKernelData < args->physBase || reserved > args->memSize ||
+            offset >= reserved || args->deviceTreeLength > reserved-offset ||
+            !ADTValid(args->deviceTreeP, args->deviceTreeLength))
+            panic("Invalid or unreserved Apple device tree");
+        uint32_t map_size;
+        const unsigned char *dtmap = ADTProperty(args->deviceTreeP,
+            "/chosen/memory-map", "DeviceTree", &map_size);
+        if (!dtmap || map_size != 8 || ADTRead(dtmap) != args->physBase+offset ||
+            ADTRead(dtmap+4) != args->deviceTreeLength)
+            panic("Apple device tree memory-map disagrees with boot_args");
+#endif
         DTInit(PE_state.deviceTreeHead);
 
         PE_early_puts("PE_init_platform: Calling pe_identify_machine\n");
         pe_identify_machine(NULL);
     } else {
         DTEntry entry;
-        char *fversion, map;
+        char *fversion;
+        void *map;
         unsigned int size;
 
         pe_initialized = 1;
@@ -167,15 +187,18 @@ void PE_init_platform(boolean_t vm_initialized, void *_args)
              * What's the iBoot version on this bad boy? 
              */
             if (kSuccess == DTGetProperty(entry, "firmware-version", (void **) &fversion, &size)) {
-                if (fversion && (strlen(fversion) <= 32)) {
-                    ovbcopy((void *) fversion, (void *) firmware_version, strlen(fversion));
-                }
+                unsigned int count = size;
+                if (count >= sizeof(firmware_version)) count = sizeof(firmware_version)-1;
+                if (fversion && count) ovbcopy(fversion, firmware_version, count);
+                firmware_version[count] = 0;
             }
             /*
              * Is the SoC debug-enabled? 
              */
             if (kSuccess == DTGetProperty(entry, "debug-enabled", (void **) &map, &size)) {
-                debug_enabled = 1;
+                debug_enabled = 0;
+                if (size > sizeof(debug_enabled)) size = sizeof(debug_enabled);
+                if (map && size) ovbcopy(map, &debug_enabled, size);
             }
         }
 

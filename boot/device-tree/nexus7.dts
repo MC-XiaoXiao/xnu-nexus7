@@ -1,0 +1,37 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/dts-v1/;
+#ifndef XNU_DT_UART
+#define XNU_DT_UART 0x70006000
+#endif
+#include "common.dtsi"
+
+/ {
+    model = "Nexus 7 (2012)";
+    compatible = "nvidia,tegra30";
+    cpus {
+        cpu0 {
+            compatible = "arm,cortex-a9";
+            timebase-frequency = <0xf4240>;
+        };
+    };
+    arm-io {
+        serial {
+            device_type = "serial";
+            compatible = "ns16550";
+            reg = <XNU_DT_UART 0x100>;
+        };
+        timer {
+            compatible = "nvidia,tegra30-timer";
+            reg = <0x60005000 0x1000>;
+            interrupts = <0x20>;
+        };
+        interrupt-controller {
+            compatible = "arm,cortex-a9-gic";
+            reg = <0x50041000 0x1000 0x50040100 0x100>;
+        };
+        legacy-interrupt-controller {
+            compatible = "nvidia,tegra30-ictlr";
+            reg = <0x60004000 0x1000>;
+        };
+    };
+};

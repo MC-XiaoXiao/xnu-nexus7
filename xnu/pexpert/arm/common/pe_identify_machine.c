@@ -88,8 +88,8 @@ void pe_identify_machine(__unused boot_args * args)
 #ifdef BOARD_CONFIG_TEGRA30_NEXUS7
     /* PLL rates are loader-dependent; only the architectural timebase is known. */
     bzero(&gPEClockFrequencyInfo, sizeof(gPEClockFrequencyInfo));
-    gPEClockFrequencyInfo.timebase_frequency_hz = 1000000;
-    gPEClockFrequencyInfo.dec_clock_rate_hz = 1000000;
+    extern void tegra30_dt_init(void);
+    tegra30_dt_init();
 #endif
     // Fill out the info from DeviceTree.
 }

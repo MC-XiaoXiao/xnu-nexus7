@@ -1,0 +1,35 @@
+/* SPDX-License-Identifier: BSD-2-Clause */
+/ {
+    #address-cells = <0x1>;
+    #size-cells = <0x1>;
+    chosen {
+        firmware-version = "uboot-xnu-shim/1";
+        stdout-path = "/arm-io/serial";
+        memory-map {
+            Kernel = <0x0 0x0>;
+            BootArgs = <0x0 0x0>;
+            DeviceTree = <0x0 0x0>;
+        };
+    };
+    /* Optional early boot overrides; missing properties use kernel defaults. */
+    defaults {
+    };
+    memory {
+        device_type = "memory";
+        reg = <0x0 0x0>;
+    };
+    cpus {
+        #address-cells = <0x1>;
+        #size-cells = <0x0>;
+        cpu0 {
+            device_type = "cpu";
+            reg = <0x0>;
+        };
+    };
+    arm-io {
+        device_type = "soc";
+        #address-cells = <0x1>;
+        #size-cells = <0x1>;
+        ranges;
+    };
+};
