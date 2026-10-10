@@ -218,9 +218,11 @@ def upload_fastboot(c,path,address):
         if active:
             c.write(b'\x03'); c.wait_prompt(15)
 
-def ensure_upload(c,path,address,transport='serial'):
+def ensure_upload(c,path,address,transport='serial',force=False):
     data=Path(path).read_bytes()
     try:
+        if force:
+            raise RuntimeError('fresh RAM upload requested')
         c.checked(f'crc32 -v {address:x} {len(data):x} {zlib.crc32(data):08x}')
         print(f'Reusing verified RAM copy: {Path(path).name}',flush=True)
     except RuntimeError:
@@ -291,6 +293,7 @@ def main():
     p.add_argument('--attempts',type=int,default=1,help='bounded debug runs, 1..10; reuses RAM only after CRC verification')
     p.add_argument('--transport',choices=['auto','serial','fastboot'],default='fastboot',
                    help='kernel RAM upload: fastboot stage/continue or XMODEM; never flash')
+    p.add_argument('--force-upload',action='store_true',help='upload kernel even if its RAM CRC already matches')
     a=p.parse_args()
     if a.device<0 or not 1<=a.partition<=128: p.error('invalid MMC device/partition')
     if a.autoboot and a.action!='deploy': p.error('--autoboot is for deploy')
@@ -334,7 +337,8 @@ def main():
                     for attempt in range(a.attempts if a.action=='debug' else 1):
                         print(f'Run {attempt+1}: watchdog deadline {a.watchdog_seconds}s',flush=True)
                         ensure_upload(c,a.bundle/'xnu-shim.bin',0x88000000)
-                        size=ensure_upload(c,a.bundle/'xnu-kernel',0x92000000,a.transport)
+                        size=ensure_upload(c,a.bundle/'xnu-kernel',0x92000000,a.transport,
+                                           force=a.force_upload and attempt==0)
                         dt_size=ensure_upload(c,a.bundle/'xnu-device-tree.adt',0x91000000)
                         fb_arguments=framebuffer_arguments(c,manifest)
                         watchdog_start(c,a.watchdog_seconds)

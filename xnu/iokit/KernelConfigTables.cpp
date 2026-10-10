@@ -45,6 +45,10 @@ const char * gIOKernelConfigTables =
 "     'IOClass'         = AppleARMPE;"
 #ifdef BOARD_CONFIG_QSD8250_LEO
 "     'IONameMatch'     = 'qsd8250,htcleo';"
+#elif defined(BOARD_CONFIG_TEGRA30_NEXUS7)
+/* Tegra MMIO/interrupt setup lives in pe_tegra30; reuse the DT platform
+ * expert to publish the CPU and arm-io nubs without changing DT identity. */
+"     'IONameMatch'     = 'nvidia,tegra30';"
 #else
 "     'IONameMatch'     = 'AppleARM';"
 #endif
