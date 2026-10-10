@@ -296,6 +296,9 @@ int IODTGetDefault(const char *key, void *infoAddr, unsigned int infoSize )
     OSData			*defaultObj;
     unsigned int		defaultSize;
 
+    /* PE_get_default is also called before the IORegistry exists. */
+    if ( gIODTPlane == 0 ) return -1;
+
     defaults = IORegistryEntry::fromPath( "/defaults", gIODTPlane );
     if ( defaults == 0 ) return -1;
 
