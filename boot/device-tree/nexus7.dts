@@ -15,6 +15,12 @@
         };
     };
     arm-io {
+        emmc {
+            compatible = "nvidia,tegra30-sdmmc4-emmc";
+            reg = <0x78000600 0x200 0x60006000 0x1000>;
+            non-removable;
+            bus-width = <0x8>;
+        };
         serial {
             device_type = "serial";
             compatible = "ns16550";

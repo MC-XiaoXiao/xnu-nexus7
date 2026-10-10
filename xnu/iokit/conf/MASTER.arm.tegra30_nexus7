@@ -19,3 +19,5 @@ options		NO_KEXTD				# <no_kextd>
 
 # Nexus7: consistent embedded policy across components.
 options CONFIG_EMBEDDED
+
+options TEGRA30_EMMC

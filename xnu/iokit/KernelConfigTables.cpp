@@ -88,6 +88,17 @@ const char * gIOKernelConfigTables =
 "  	   'IOProviderClass'   = AppleARMIODevice;"
 "  	   'IONameMatch'       = 'programmer-switch';"
 "  	}"
+#if defined(TEGRA30_EMMC)
+",{ 'IOClass' = Tegra30EMMC; 'IOProviderClass' = AppleARMIODevice;"
+"   'IONameMatch' = 'nvidia,tegra30-sdmmc4-emmc'; }"
+",{ 'IOClass' = IOBlockStorageDriver; 'IOProviderClass' = IOBlockStorageDevice; }"
+",{ 'IOClass' = IOMediaBSDClient; 'IOProviderClass' = IOMedia;"
+"   'IOMatchCategory' = IOMediaBSDClient; 'IOResourceMatch' = IOBSD; }"
+",{ 'IOClass' = IOFDiskPartitionScheme; 'IOProviderClass' = IOMedia;"
+"   'IOMatchCategory' = IOStorage; 'IOProbeScore' = 3000:32;"
+"   'IOPropertyMatch' = { 'Whole' = .true.; }; 'Content Mask' = 'FDisk_partition_scheme';"
+"   'Content Table' = { '0x83' = Linux; '0xAF' = 'Apple_HFS'; }; }"
+#endif
 #endif
 #if defined(BOARD_CONFIG_QSD8250_LEO)
 "," 
