@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import re
 import sys
+import os
 from collections import deque
 from pathlib import Path, PurePosixPath
 
@@ -79,12 +80,19 @@ def manifest_check() -> tuple[int, list[str]]:
             continue
         expected[name] = digest
 
-    actual_paths = {
-        relative(path)
-        for path in ROOT.rglob("*")
-        if path.is_file() and ".git" not in path.relative_to(ROOT).parts
-        and path != manifest_path and not path.is_symlink()
-    }
+    # Generated build products are intentionally outside the source manifest.
+    # Prune them before walking to avoid scanning large object/export trees.
+    actual_paths: set[str] = set()
+    for directory, dirs, files in os.walk(ROOT):
+        dirs[:] = [name for name in dirs if name not in {".git", "__pycache__"}
+                   and not (Path(directory) == ROOT and name == "build")]
+        for name in files:
+            path = Path(directory) / name
+            if path == manifest_path or path.is_symlink() or name.endswith(".pyc"):
+                continue
+            if path == ROOT / "build-first.log":
+                continue
+            actual_paths.add(relative(path))
     for name in sorted(expected.keys() - actual_paths):
         errors.append(f"manifest path missing from checkout: {name}")
     for name in sorted(actual_paths - expected.keys()):

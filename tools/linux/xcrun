@@ -1,0 +1,8 @@
+#!/bin/sh
+case "$*" in
+  *show-sdk-path*) echo / ;;
+  *clang*) echo /usr/bin/clang ;;
+  *flex*) echo /usr/bin/flex ;;
+  *bison*) echo /usr/bin/bison ;;
+  *) echo "Unsupported SDK tool lookup: $*" >&2; exit 1 ;;
+esac

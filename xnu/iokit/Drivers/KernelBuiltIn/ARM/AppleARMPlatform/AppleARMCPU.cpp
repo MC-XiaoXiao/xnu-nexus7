@@ -39,7 +39,7 @@ bool AppleARMCPU::start(IOService * provider)
         panic("Failed to alloc class for dumb interrupt controller, we suck hard");
     }
 
-#ifdef BOARD_CONFIG_QSD8250_LEO
+#if defined(BOARD_CONFIG_QSD8250_LEO) || defined(BOARD_CONFIG_TEGRA30_NEXUS7)
     if (gIC->initCPUInterruptController(1) != kIOReturnSuccess || !gIC->attach(this))
         panic("Leo CPU interrupt-controller initialization failed");
 #else
@@ -50,13 +50,13 @@ bool AppleARMCPU::start(IOService * provider)
 
     setCPUState(kIOCPUStateUninitalized);
 
-#ifndef BOARD_CONFIG_QSD8250_LEO
+#if !defined(BOARD_CONFIG_QSD8250_LEO) && !defined(BOARD_CONFIG_TEGRA30_NEXUS7)
     initCPU(true);
     registerService();
 #endif
 
 
-#ifdef BOARD_CONFIG_QSD8250_LEO
+#if defined(BOARD_CONFIG_QSD8250_LEO) || defined(BOARD_CONFIG_TEGRA30_NEXUS7)
     machProcessor = PROCESSOR_NULL;
     ipi_handler = NULL;
     kern_return_t result = ml_processor_register((cpu_id_t)this,

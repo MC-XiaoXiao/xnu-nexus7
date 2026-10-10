@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Rename non-debug sections in little-endian Mach-O ARM objects."""
+import struct
+import sys
+from pathlib import Path
+name, source, option, dest = sys.argv[1:]
+assert option == '-o' and len(name.encode()) <= 16
+b = bytearray(Path(source).read_bytes())
+u32 = lambda pos: struct.unpack_from('<I', b, pos)[0]
+assert u32(0) == 0xfeedface and u32(12) == 1, 'expected 32-bit MH_OBJECT'
+pos = 28
+for _ in range(u32(16)):
+    cmd, size = struct.unpack_from('<II', b, pos)
+    assert size >= 8 and pos + size <= len(b)
+    if cmd == 1:
+        for i in range(u32(pos + 48)):
+            sec = pos + 56 + i * 68
+            assert sec + 68 <= pos + size
+            if not u32(sec + 56) & 0x02000000:
+                b[sec + 16:sec + 32] = name.encode().ljust(16, b'\0')
+    pos += size
+Path(dest).write_bytes(b)

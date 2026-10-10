@@ -1,0 +1,16 @@
+######################################################################
+#
+#  RELEASE	= [ arm mach libkerncpp hibernation networking crypto allcrypto zlib config_kxld config_static_cppinit iokitstats vm_pressure_events secure_kernel ]
+#  PROFILE	= [ RELEASE profile ]
+#  DEBUG	= [ RELEASE debug ]
+#
+#  EMBEDDED	= [ arm mach libkerncpp networking crypto zlib config_kxld ]
+#  DEVELOPMENT	= [ EMBEDDED ]
+#
+######################################################################
+
+machine		"arm"					# <arm>
+cpu		"arm"					# <arm>
+
+# Nexus7: consistent embedded policy across components.
+options CONFIG_EMBEDDED

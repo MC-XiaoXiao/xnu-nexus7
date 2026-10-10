@@ -61,6 +61,12 @@ decl_simple_lock_data(static, kprintf_lock)
 void PE_init_kprintf(boolean_t vm_initialized)
 {
     unsigned int boot_arg;
+#ifdef BOARD_CONFIG_TEGRA30_NEXUS7
+    if (vm_initialized) {
+        extern void tegra30_uart_init(void);
+        tegra30_uart_init();
+    }
+#endif
 
     if (PE_state.initialized == FALSE)
         panic("Platform Expert not initialized");
@@ -79,7 +85,10 @@ void PE_init_kprintf(boolean_t vm_initialized)
          * * call pal_serial_init() if our previous state was
          * * not enabled 
          */
-#ifdef BOARD_CONFIG_QSD8250_LEO
+#if defined(BOARD_CONFIG_TEGRA30_NEXUS7)
+        extern void tegra30_early_putc(char);
+        PE_kputc = tegra30_early_putc;
+#elif defined(BOARD_CONFIG_QSD8250_LEO)
         extern void ios7leo_debug_putc(char);
         PE_kputc=ios7leo_debug_putc;
 #else

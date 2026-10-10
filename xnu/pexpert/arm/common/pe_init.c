@@ -151,7 +151,7 @@ void PE_init_platform(boolean_t vm_initialized, void *_args)
         PE_kputc = gPESocDispatch.uart_putc;
         unsigned int boot_arg;
 
-#ifndef BOARD_CONFIG_QSD8250_LEO
+#if !defined(BOARD_CONFIG_QSD8250_LEO) && !defined(BOARD_CONFIG_TEGRA30_NEXUS7)
         if (PE_parse_boot_argn("kprintf", &boot_arg, sizeof(boot_arg)))
             PE_kputc = cnputc;
 #endif

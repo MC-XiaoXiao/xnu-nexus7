@@ -55,3 +55,33 @@ After correction, the same 74 planned inputs classify as 47 raw byte matches, 24
 A broader comparison covered 140 source/header observations across the 033, 034, 036, 067, and 070 overlay snapshots. Repeated paths in different snapshots are counted separately. At the corrected public tree these observations comprise 113 raw matches, three notice-only matches, five neutralized nonce observations, one relocated raw match, two intentionally neutralized identity examples, 15 content differences between historical snapshots and the public tree, and one path absent from the public tree. Those 15 differences include superseded or staged versions and should not be read as 15 missing 070 inputs. The remaining absent path, `leo_scanout_row.c`, occurs in the 036 snapshot but not the 070 input list; it was not copied as part of this correction.
 
 The raw per-file SHA-256 values and comparison classifications are preserved in a local private audit record and are not part of this repository. The current exhaustive manifest has 3,862 entries for 3,863 tracked files (the manifest itself is excluded); all rows matched current file hashes with no missing, extra, or duplicate paths. The plan records two newly compiled source rows; matching its 74 source/header inputs does not independently prove the origin of every retained object or establish that this source tree reproduces the final kernel binary. A standalone rebuild still requires the external Darwin/Mach-O ARM toolchain and generated target headers described above. No build, test, emulator, or device operation was performed for this source review.
+
+## Nexus7 local build follow-up (2026-10-09)
+
+The sections above describe the earlier HD2 source review. This follow-up adds
+TEGRA30_NEXUS7 and supersedes the earlier statement that no build was performed
+for the current checkout. It does not retroactively validate the HD2 target.
+
+A fresh DEVELOPMENT/ARM/TEGRA30_NEXUS7 build in `build/obj-nexus7` on Linux with
+Clang 23.1.1, MIG93 and cctools ld64-956.6 compiled and linked 736 ARMv7 Mach-O
+objects. `tools/build-nexus7.sh` verifies MH_EXECUTE/MH_NOUNDEFS, executable entry
+0x800e08e0, segment bounds, platform symbols and zero unresolved symbols. It also
+rejects submake errors that older recursive recipes can otherwise conceal.
+Generated headers and MIG outputs were produced from this checkout's inputs.
+The report and hashes are generated in `build/output/`; build products are
+excluded from the source manifest. Build prerequisites and limitations are
+recorded in README.md. The source checker now prunes generated build/cache
+paths so its manifest remains a source inventory after compilation.
+
+The actual platform source passes host MMIO tests for UART bounds and remapping,
+GIC/LIC routing and EOI, microsecond-counter rollover and timer IRQ dispatch.
+These tests and a successful link do not establish hardware boot or runtime
+acceptance. No flashing, boot-image generation or device operation was performed.
+The original source base is Darwin 13.0.0, not an iOS 4 kernel. This target is
+single-CPU and serial-only, with no storage/root filesystem or dynamic KEXT path.
+
+The updated Python static checker was executed locally: 3,882 manifest entries
+match, all 127 ARM source-list rows are present, and 1,884 files are visited.
+Its 329 candidate unresolved includes and 43 absent common-list rows remain
+configuration/generated/other-target diagnostics of the static scan; the exact
+Nexus7 configuration has independently completed compilation and linking.

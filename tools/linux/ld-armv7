@@ -1,0 +1,21 @@
+#!/usr/bin/env python3
+"""Translate XNU's compiler-driver linker flags to cctools ld64."""
+import os, sys, re, subprocess, json
+from pathlib import Path
+Path('link-argv.json').write_text(json.dumps(sys.argv[1:]))
+args = []
+for a in sys.argv[1:]:
+    if a.startswith('-Wl,'):
+        args.extend(a[4:].split(','))
+    elif not a.startswith('-D') and a not in ('-nostdlib', '-fapple-kext'):
+        args.append(a)
+tools = os.environ.get('NEXUS7_CCTOOLS', '/home/xxiao/Projects/Project_iOS2ARM/build/toolchain/bin')
+if '-filelist' in args:
+    paths = Path(args[args.index('-filelist') + 1]).read_text().splitlines()
+    symbols = subprocess.check_output([str(Path(tools)/'arm-apple-darwin11-nm'), '-u', '-j', *paths], text=True, stderr=subprocess.DEVNULL)
+    aliases = sorted(set(re.findall(r'^(_(?:memcpy|memset|memmove|bzero|__divsi3|__udivsi3|__umodsi3))\.([0-9]+)$', symbols, re.M)))
+    if aliases:
+        alias_file = Path('clang-intrinsic-aliases.map').resolve()
+        alias_file.write_text(''.join(f'{base} {base}.{number}\n' for base, number in aliases))
+        args += ['-alias_list', str(alias_file)]
+os.execv(str(Path(tools)/'arm-apple-darwin11-ld'), ['ld64'] + args)

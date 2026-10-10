@@ -1,3 +1,4 @@
+DOCONF ?= $(SRCROOT)/SETUP/config/doconf
 export MakeInc_cmd=${SRCROOT}/makedefs/MakeInc.cmd
 export MakeInc_def=${SRCROOT}/makedefs/MakeInc.def
 export MakeInc_rule=${SRCROOT}/makedefs/MakeInc.rule
@@ -25,7 +26,7 @@ endif
 
 MASTER_CPU_PER_SOC = $(SOURCE)/MASTER.$(ARCH_CONFIG_LC).$(MACHINE_CONFIG_LC)
 
-$(COMPOBJROOT)/$(SECURITY_KERNEL_CONFIG)/Makefile :  $(SOURCE)/MASTER  \
+$(COMPOBJROOT)/$(SECURITY_KERNEL_CONFIG)/Makefile : $(wildcard $(MASTER_CPU_PER_SOC)) $(SOURCE)/MASTER  \
 	$(SOURCE)/MASTER.$(ARCH_CONFIG_LC) \
 	$(SOURCE)/Makefile.template  \
 	$(SOURCE)/Makefile.$(ARCH_CONFIG_LC)  \
@@ -37,7 +38,7 @@ $(COMPOBJROOT)/$(SECURITY_KERNEL_CONFIG)/Makefile :  $(SOURCE)/MASTER  \
 	rm -f $(notdir $?); \
 	cp  $? $${doconf_target}; \
 	if [ -f $(MASTER_CPU_PER_SOC) ]; then cp $(MASTER_CPU_PER_SOC) $${doconf_target}; fi; \
-	$(SRCROOT)/SETUP/config/doconf -c -cpu $(ARCH_CONFIG_LC) -soc $(MACHINE_CONFIG_LC) -d  $(TARGET)/$(SECURITY_KERNEL_CONFIG) $(SECURITY_KERNEL_CONFIG); \
+	$(DOCONF) -c -cpu $(ARCH_CONFIG_LC) -soc $(MACHINE_CONFIG_LC) -d  $(TARGET)/$(SECURITY_KERNEL_CONFIG) $(SECURITY_KERNEL_CONFIG); \
 	);
 
 do_all: $(COMPOBJROOT)/$(SECURITY_KERNEL_CONFIG)/Makefile

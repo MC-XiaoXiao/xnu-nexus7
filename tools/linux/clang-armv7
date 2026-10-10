@@ -1,0 +1,17 @@
+#!/usr/bin/env python3
+import os, sys
+args = sys.argv[1:]
+out = []
+lang = ['-std=gnu++98'] if any(a.endswith(('.cpp', '.cc', '.cxx')) for a in args) else ['-std=gnu99']
+i = 0
+while i < len(args):
+    a = args[i]
+    if a == '-arch':
+        i += 2
+        continue
+    if a in ('-freorder-blocks', '-fno-keep-inline-functions', '-no-integrated-as'):
+        i += 1
+        continue
+    out.append(a.replace('-Werror', '-Wno-error') if a.startswith('-Werror') else a)
+    i += 1
+os.execvp('clang', ['clang', '-target', 'armv7-apple-darwin11', '-Wno-error', '-Wno-implicit-function-declaration', '-Wno-int-conversion', '-Wno-incompatible-pointer-types', '-Wno-deprecated-non-prototype'] + lang + out)

@@ -165,6 +165,10 @@ void arm_init(boot_args * args)
     ios7leo_checkpoint(args,8);
     ios7leo_forget_early_maps();
 #endif
+#ifdef BOARD_CONFIG_TEGRA30_NEXUS7
+    extern void tegra30_uart_suspend(void);
+    tegra30_uart_suspend();
+#endif
     arm_vm_init(maxMem, args);
 
     /*

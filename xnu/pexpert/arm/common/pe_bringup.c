@@ -47,7 +47,10 @@
 void PE_early_puts(char *s)
 {
     while (*s != '\0') {
-#ifdef BOARD_CONFIG_QSD8250_LEO
+#if defined(BOARD_CONFIG_TEGRA30_NEXUS7)
+        extern void tegra30_early_putc(char);
+        tegra30_early_putc(*s);
+#elif defined(BOARD_CONFIG_QSD8250_LEO)
         extern void ios7leo_debug_putc(char);
         ios7leo_debug_putc(*s); /* boundedRAM debug text, no monitor/UART/video */
 #else

@@ -1,5 +1,7 @@
 /* HTC HD2 integration/publication changes: Garysss123, 2026-10-04. Original license notices are preserved. */
+#ifdef BOARD_CONFIG_QSD8250_LEO
 #include "../../../nokextd/IOS7NoKextd035.h"
+#endif
 /*
  * Copyright (c) 1998-2010 Apple Inc. All rights reserved.
  *

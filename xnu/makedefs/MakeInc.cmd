@@ -289,8 +289,8 @@ else ifeq ($(UNAME_S),Linux)
 	##
 	# Other special tools
 	##
-	SEG_HACK := $(shell $(XCRUN) -sdk $(SDKROOT) -find setsegname)
-	KEXT_CREATE_SYMBOL_SET := $(shell $(XCRUN) -sdk $(SDKROOT) -find kextsymboltool)
+	SEG_HACK ?= $(shell $(XCRUN) -sdk $(SDKROOT) -find setsegname)
+	KEXT_CREATE_SYMBOL_SET ?= $(shell $(XCRUN) -sdk $(SDKROOT) -find kextsymboltool)
 	DECOMMENT := $(OBJROOT)/SETUP/decomment/decomment
 	NEWVERS = $(SRCROOT)/config/newvers.pl
 	MD := $(OBJROOT)/SETUP/md/md

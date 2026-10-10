@@ -112,11 +112,18 @@ mmu_reinitialize:
     orr     r6, r6, #0x400      /* Permissions */
 
     /* Identity map UART for right now */
+    #ifdef BOARD_CONFIG_TEGRA30_NEXUS7
+    LoadConstantToReg((0x70000000), r7)
+#else
     LoadConstantToReg((0x7f600000), r7)
+#endif
     mov     r7, r7, lsr#20
     add     r5, r4, r7, lsl#2
     mov     r7, r7, lsl#20
     orr     r8, r7, r6
+#ifdef BOARD_CONFIG_TEGRA30_NEXUS7
+    bic     r8, r8, #0xc /* UART: strongly ordered, never cacheable. */
+#endif
     str     r8, [r5]
 
     mov     r7, pc, lsr#20

@@ -1,5 +1,7 @@
 /* HTC HD2 integration/publication changes: Garysss123, 2026-10-04. Original license notices are preserved. */
+#ifdef BOARD_CONFIG_QSD8250_LEO
 #include "../../../nokextd/IOS7NoKextd035.h"
+#endif
 /*
  * Copyright (c) 2008-2009 Apple Inc. All rights reserved.
  *
@@ -257,8 +259,14 @@ static bool                 sKernelRequestsEnabled     = false;
 #else
 static bool                 sKernelRequestsEnabled     = true;
 #endif
+#ifdef BOARD_CONFIG_TEGRA30_NEXUS7
+/* Minimal Nexus7 image has permanent built-ins and no module runtime. */
+static bool                 sLoadEnabled               = false;
+static bool                 sUnloadEnabled             = false;
+#else
 static bool                 sLoadEnabled               = true;
 static bool                 sUnloadEnabled             = true;
+#endif
 
 /*********************************************************************
 * Stuff for the OSKext representing the kernel itself.
@@ -1190,7 +1198,12 @@ OSKext::setLoadEnabled(bool flag)
 
     IORecursiveLockLock(sKextLock);
     result = sLoadEnabled;
+#ifdef BOARD_CONFIG_TEGRA30_NEXUS7
+    (void)flag;
+    sLoadEnabled = false;
+#else
     sLoadEnabled = (flag ? true : false);
+#endif
     
     if (sLoadEnabled != result) {
         OSKextLog(/* kext */ NULL,
@@ -1228,7 +1241,12 @@ OSKext::setUnloadEnabled(bool flag)
 
     IORecursiveLockLock(sKextLock);
     result = sUnloadEnabled;
+#ifdef BOARD_CONFIG_TEGRA30_NEXUS7
+    (void)flag;
+    sUnloadEnabled = false;
+#else
     sUnloadEnabled = (flag ? true : false);
+#endif
     IORecursiveLockUnlock(sKextLock);
     
     if (sUnloadEnabled != result) {

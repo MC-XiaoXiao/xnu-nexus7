@@ -1,0 +1,2 @@
+#!/bin/sh
+exec clang -std=gnu89 -D_DEFAULT_SOURCE -Wno-error -Wno-implicit-function-declaration -Wno-int-conversion "$@"
