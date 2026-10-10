@@ -230,6 +230,9 @@ typedef struct arm_l2_t {
 #define L2_S_BIT 0x400          /* S bit */
 #define L2_NG_BIT 0x800         /* nG bit */
 
+extern kern_return_t arm_fast_fault(pmap_t pmap, vm_map_offset_t va,
+                                     vm_prot_t fault_type, boolean_t from_user);
+
 extern addr64_t kvtophys(vm_offset_t va);   /* Get physical address from kernel virtual */
 extern vm_map_offset_t kvtophys64(vm_map_offset_t va);  /* Get 64-bit physical address from kernel virtual */
 extern vm_offset_t pmap_map(vm_offset_t virt, vm_map_offset_t start,

@@ -375,6 +375,8 @@ typedef struct pv_rooted_entry {    /* common prefix must match pv_hashed_entry_
     pmap_t pmap;                /* pmap where mapping lies */
 #if BOARD_CONFIG_QSD8250_LEO
     boolean_t mapping_wired;
+#else
+    uint32_t fault_access;      /* logical AP/XN permissions and tracking faults */
 #endif
     uint32_t flags;             /* address flags */
 } *pv_rooted_entry_t;
@@ -389,6 +391,8 @@ typedef struct pv_hashed_entry {    /* common prefix must match pv_rooted_entry_
     pmap_t pmap;
 #if BOARD_CONFIG_QSD8250_LEO
     boolean_t mapping_wired;
+#else
+    uint32_t fault_access;      /* logical AP/XN permissions and tracking faults */
 #endif
     ppnum_t ppn;
     struct pv_hashed_entry *nexth;
@@ -445,7 +449,8 @@ uint32_t mappingrecurse = 0;
       pv_hashed_free_list = (pv_hashed_entry_t)pvh_e->qlink.next;   \
             pv_hashed_free_count--; \
             if (pv_hashed_free_count < PV_HASHED_LOW_WATER_MARK) \
-              if (hw_compare_and_store(0,1,(u_int *)&mappingrecurse)) \
+              if (mapping_adjust_call != NULL && \
+                  hw_compare_and_store(0,1,(u_int *)&mappingrecurse)) \
                 thread_call_enter(mapping_adjust_call); \
     } \
     simple_unlock(&pv_hashed_free_list_lock); \
@@ -465,7 +470,8 @@ uint32_t mappingrecurse = 0;
       pv_hashed_kern_free_list = (pv_hashed_entry_t)pvh_e->qlink.next;  \
             pv_hashed_kern_free_count--; \
             if (pv_hashed_kern_free_count < PV_HASHED_KERN_LOW_WATER_MARK) \
-              if (hw_compare_and_store(0,1,(u_int *)&mappingrecurse)) \
+              if (mapping_adjust_call != NULL && \
+                  hw_compare_and_store(0,1,(u_int *)&mappingrecurse)) \
                 thread_call_enter(mapping_adjust_call); \
     } \
     simple_unlock(&pv_hashed_kern_free_list_lock); \
@@ -1004,6 +1010,9 @@ static inline __attribute__ ((always_inline)) pv_hashed_entry_t pmap_pv_remove(p
             UNLOCK_PV_HASH(pvhash_idx);
             pv_h->pmap = pvh_e->pmap;
             pv_h->va = pvh_e->va;
+#if !BOARD_CONFIG_QSD8250_LEO
+            pv_h->fault_access = pvh_e->fault_access;
+#endif
 #if BOARD_CONFIG_QSD8250_LEO
             pv_h->mapping_wired = pvh_e->mapping_wired;
 #endif   /* dispose of pvh_e */
@@ -1164,6 +1173,250 @@ void phys_attribute_set(ppnum_t pn, int bits)
     return;
 }
 
+#define PMAP_MAPPING_WIRED (1U << 29)
+#define PMAP_FAULT_REF (1U << 30)
+#define PMAP_FAULT_MOD (1U << 31)
+#define PMAP_ACCESS_MASK (L2_ACCESS_PRW | L2_ACCESS_USER | L2_ACCESS_APX)
+
+#if !BOARD_CONFIG_QSD8250_LEO
+/* Two bootstrap bits per virtual page: an explicitly entered mapping and
+ * its wiring state. Raw physical-linear mappings never enter this bitmap.
+ * This covers the entire ARM32 VA space without a boot allocation recursion. */
+#define PMAP_BOOT_PRESENT 1U
+#define PMAP_BOOT_WIRED 2U
+#define PMAP_BOOT_WORDS (1U << (32 - PAGE_SHIFT - 4))
+static uint32_t pmap_boot_mappings[PMAP_BOOT_WORDS];
+static unsigned int pmap_boot_mapping_count;
+
+static unsigned int pmap_boot_mapping_state(vm_map_offset_t va)
+{
+    unsigned int page = va >> PAGE_SHIFT;
+    return (pmap_boot_mappings[page >> 4] >> ((page & 15U) * 2)) & 3U;
+}
+
+static void pmap_boot_mapping_enter(pmap_t pmap, vm_map_offset_t va, boolean_t wired)
+{
+    unsigned int page = va >> PAGE_SHIFT, shift = (page & 15U) * 2;
+    unsigned int old = pmap_boot_mapping_state(va);
+    unsigned int state = PMAP_BOOT_PRESENT | (wired ? PMAP_BOOT_WIRED : 0);
+
+    if (pmap != kernel_pmap)
+        panic("pmap bootstrap mapping must belong to kernel");
+    if (!(old & PMAP_BOOT_PRESENT)) {
+        pmap_boot_mapping_count++;
+        pmap->pm_stats.resident_count++;
+        pmap_ledger_credit(pmap, task_ledgers.phys_mem, PAGE_SIZE);
+    }
+    if ((old ^ state) & PMAP_BOOT_WIRED) {
+        if (wired) {
+            pmap->pm_stats.wired_count++;
+            pmap_ledger_credit(pmap, task_ledgers.wired_mem, PAGE_SIZE);
+        } else {
+            assert(pmap->pm_stats.wired_count > 0);
+            pmap->pm_stats.wired_count--;
+            pmap_ledger_debit(pmap, task_ledgers.wired_mem, PAGE_SIZE);
+        }
+    }
+    pmap_boot_mappings[page >> 4] =
+        (pmap_boot_mappings[page >> 4] & ~(3U << shift)) | (state << shift);
+}
+
+/* The caller batches the resident and wiring ledger debits. */
+static unsigned int pmap_boot_mapping_remove(pmap_t pmap, vm_map_offset_t va)
+{
+    unsigned int page = va >> PAGE_SHIFT, shift = (page & 15U) * 2;
+    unsigned int old = pmap_boot_mapping_state(va);
+
+    if (pmap != kernel_pmap)
+        panic("pmap bootstrap removal must belong to kernel");
+    if (old & PMAP_BOOT_PRESENT) {
+        assert(pmap_boot_mapping_count > 0);
+        pmap_boot_mapping_count--;
+        pmap_boot_mappings[page >> 4] &= ~(3U << shift);
+    }
+    return old;
+}
+
+/* Caller holds the physical page's PV lock. */
+static pv_rooted_entry_t pmap_find_pv(pmap_t pmap, ppnum_t pn, vm_map_offset_t va)
+{
+    pv_rooted_entry_t head, entry;
+    if (!pmap_valid_page(pn)) {
+        pv_hashed_entry_t hashed;
+        int bucket = pvhashidx(pmap, va);
+        LOCK_PV_HASH(bucket);
+        for (hashed = *pvhash(bucket); hashed; hashed = hashed->nexth) {
+            if (hashed->pmap == pmap && hashed->va == va && hashed->ppn == pn)
+                break;
+        }
+        UNLOCK_PV_HASH(bucket);
+        return (pv_rooted_entry_t)hashed;
+    }
+    head = pai_to_pvh(pn);
+    entry = head;
+    if (head->pmap == PMAP_NULL)
+        return PV_ROOTED_ENTRY_NULL;
+    do {
+        if (entry->pmap == pmap && entry->va == va)
+            return entry;
+        entry = (pv_rooted_entry_t)queue_next(&entry->qlink);
+    } while (entry != head);
+    return PV_ROOTED_ENTRY_NULL;
+}
+
+/* Unmanaged mappings use the existing hash/zone but have no physical root. */
+static void pmap_unmanaged_pv_add(pmap_t pmap, vm_map_offset_t va, ppnum_t pn,
+                                  pv_hashed_entry_t entry)
+{
+    int bucket = pvhashidx(pmap, va);
+    entry->pmap = pmap;
+    entry->va = va;
+    entry->ppn = pn;
+    entry->fault_access = 0;
+    queue_init(&entry->qlink);
+    LOCK_PV_HASH(bucket);
+    entry->nexth = *pvhash(bucket);
+    *pvhash(bucket) = entry;
+    UNLOCK_PV_HASH(bucket);
+}
+
+/* zone_map is not created until after pmap_init. Reserve permanent nodes
+ * through kernel_map, which is already ready. Allocating the reserve creates
+ * additional bootstrap mappings, so grow it to cover the final mapping set
+ * before replaying any PV entries. Nodes remain in the pmap free pools. */
+static void pmap_bootstrap_pv(void)
+{
+    pv_hashed_entry_t reserve = PV_HASHED_ENTRY_NULL, tail = PV_HASHED_ENTRY_NULL, node;
+    pv_rooted_entry_t root, entry;
+    unsigned int reserved = 0, word, slot, state;
+    vm_map_offset_t va;
+    pt_entry_t *pte;
+    ppnum_t pn;
+
+    while (reserved < pmap_boot_mapping_count) {
+        vm_offset_t storage;
+        vm_size_t bytes = round_page((pmap_boot_mapping_count - reserved) * sizeof(*node));
+        unsigned int count = bytes / sizeof(*node), n;
+        if (kernel_memory_allocate(kernel_map, &storage, bytes, 0,
+                                   KMA_KOBJECT | KMA_PERMANENT) != KERN_SUCCESS)
+            panic("pmap bootstrap PV allocation failed");
+        for (n = 0; n < count; n++) {
+            node = &((pv_hashed_entry_t)storage)[n];
+            bzero(node, sizeof(*node));
+            node->qlink.next = (queue_entry_t)reserve;
+            reserve = node;
+            if (!tail)
+                tail = node;
+            reserved++;
+        }
+    }
+    for (word = 0; word < PMAP_BOOT_WORDS; word++) {
+        if (!pmap_boot_mappings[word])
+            continue;
+        for (slot = 0; slot < 16; slot++) {
+            state = (pmap_boot_mappings[word] >> (slot * 2)) & 3U;
+            if (!(state & PMAP_BOOT_PRESENT))
+                continue;
+            va = ((word << 4) | slot) << PAGE_SHIFT;
+            pte = (pt_entry_t *)pmap_pte(kernel_pmap, va);
+            if (!pte || !(*pte & ARM_PTE_DESCRIPTOR_4K))
+                panic("pmap bootstrap PV descriptor missing");
+            pn = pa_index(*pte & L2_ADDR_MASK);
+            root = pmap_valid_page(pn) ? pai_to_pvh(pn) : PV_ROOTED_ENTRY_NULL;
+            if (root && root->pmap == PMAP_NULL) {
+                entry = root;
+                entry->pmap = kernel_pmap;
+                entry->va = va;
+                queue_init(&entry->qlink);
+            } else {
+                assert(reserve && reserved);
+                node = reserve;
+                reserve = (pv_hashed_entry_t)node->qlink.next;
+                reserved--;
+                if (root) {
+                    node->pmap = kernel_pmap;
+                    node->va = va;
+                    node->ppn = pn;
+                    pv_hash_add(node, root);
+                } else {
+                    pmap_unmanaged_pv_add(kernel_pmap, va, pn, node);
+                }
+                entry = (pv_rooted_entry_t)node;
+            }
+            entry->fault_access = *pte & (PMAP_ACCESS_MASK | L2_NX_BIT);
+            if (state & PMAP_BOOT_WIRED)
+                entry->fault_access |= PMAP_MAPPING_WIRED;
+            if (root) {
+                root->flags |= PMAP_OSPTE_TYPE_REFERENCED;
+                if ((*pte & L2_ACCESS_PRW) && !(*pte & L2_ACCESS_APX))
+                    root->flags |= PMAP_OSPTE_TYPE_MODIFIED;
+                if (state & PMAP_BOOT_WIRED)
+                    root->flags |= PMAP_OSPTE_TYPE_WIRED;
+            }
+            pmap_boot_mapping_remove(kernel_pmap, va);
+        }
+    }
+    assert(pmap_boot_mapping_count == 0);
+    if (reserve)
+        PV_HASHED_FREE_LIST(reserve, tail, reserved);
+}
+
+/* Per-mapping wiring is distinct from the page-wide "any alias wired" bit. */
+static void pmap_mapping_wire(pv_rooted_entry_t entry, boolean_t wired)
+{
+    boolean_t old = (entry->fault_access & PMAP_MAPPING_WIRED) != 0;
+    wired = (wired != FALSE);
+    if (old == wired)
+        return;
+    if (wired) {
+        entry->fault_access |= PMAP_MAPPING_WIRED;
+        OSAddAtomic(1, &entry->pmap->pm_stats.wired_count);
+        pmap_ledger_credit(entry->pmap, task_ledgers.wired_mem, PAGE_SIZE);
+    } else {
+        entry->fault_access &= ~PMAP_MAPPING_WIRED;
+        assert(entry->pmap->pm_stats.wired_count > 0);
+        OSAddAtomic(-1, &entry->pmap->pm_stats.wired_count);
+        pmap_ledger_debit(entry->pmap, task_ledgers.wired_mem, PAGE_SIZE);
+    }
+}
+
+static void pmap_wire_refresh(ppnum_t pn)
+{
+    pv_rooted_entry_t head = pai_to_pvh(pn), entry = head;
+    boolean_t wired = FALSE;
+    if (head->pmap != PMAP_NULL) {
+        do {
+            if (entry->fault_access & PMAP_MAPPING_WIRED)
+                wired = TRUE;
+            entry = (pv_rooted_entry_t)queue_next(&entry->qlink);
+        } while (entry != head);
+    }
+    if (wired)
+        head->flags |= PMAP_OSPTE_TYPE_WIRED;
+    else
+        head->flags &= ~PMAP_OSPTE_TYPE_WIRED;
+}
+
+static void pmap_fault_protect(pmap_t pmap, vm_map_offset_t va, pt_entry_t pte)
+{
+    ppnum_t pn = pa_index(pte & L2_ADDR_MASK);
+    if (pmap_initialized) {
+        pv_rooted_entry_t entry;
+        boolean_t managed = pmap_valid_page(pn);
+        if (managed)
+            LOCK_PVH(pn);
+        entry = pmap_find_pv(pmap, pn, va);
+        if (entry) {
+            entry->fault_access |= L2_ACCESS_APX;
+            entry->fault_access &= ~(PMAP_FAULT_MOD | L2_NX_BIT);
+            entry->fault_access |= pte & L2_NX_BIT;
+        }
+        if (managed)
+            UNLOCK_PVH(pn);
+    }
+}
+#endif
+
 /**
  * pmap_adjust_unnest_parameters
  *
@@ -1183,6 +1436,68 @@ boolean_t pmap_adjust_unnest_parameters(pmap_t p, vm_map_offset_t * s, vm_map_of
 kern_return_t pmap_attribute(pmap_t pmap, vm_offset_t address, vm_size_t size, vm_machine_attribute_t atte, vm_machine_attribute_val_t * attrp)
 {
     return KERN_INVALID_ADDRESS;
+}
+
+void pmap_flush_tlbs(pmap_t pmap, vm_map_offset_t startv, vm_map_offset_t endv);
+
+kern_return_t arm_fast_fault(pmap_t pmap, vm_map_offset_t va,
+                             vm_prot_t fault_type, boolean_t from_user)
+{
+#if BOARD_CONFIG_QSD8250_LEO
+    return KERN_FAILURE;
+#else
+    pt_entry_t *ptep, pte, access;
+    pv_rooted_entry_t entry;
+    ppnum_t pn;
+    kern_return_t result = KERN_FAILURE;
+    if (pmap == PMAP_NULL || !pmap_initialized ||
+        !(fault_type & (VM_PROT_READ | VM_PROT_WRITE | VM_PROT_EXECUTE)))
+        return result;
+    va &= ~PAGE_MASK;
+    PMAP_LOCK(pmap);
+    if ((va >> L1SHIFT) >= pmap->pm_l1_size / sizeof(pt_entry_t))
+        goto unlock_pmap;
+    ptep = (pt_entry_t *)pmap_pte(pmap, va);
+    if (!ptep || !(*ptep & ARM_PTE_DESCRIPTOR_4K))
+        goto unlock_pmap;
+    pte = *ptep;
+    pn = pa_index(pte & L2_ADDR_MASK);
+    if (!pmap_valid_page(pn))
+        goto unlock_pmap;
+    LOCK_PVH(pn);
+    entry = pmap_find_pv(pmap, pn, va);
+    if (!entry)
+        goto unlock_pv;
+    access = entry->fault_access;
+    if (!(access & PMAP_FAULT_REF) &&
+        !((fault_type & VM_PROT_WRITE) && (access & PMAP_FAULT_MOD)))
+        goto unlock_pv;
+    /* Restore only the logical permissions last supplied by VM. */
+    if (!(access & L2_ACCESS_PRW) ||
+        (from_user && !(access & L2_ACCESS_USER)) ||
+        ((fault_type & VM_PROT_WRITE) && (access & L2_ACCESS_APX)) ||
+        ((fault_type & VM_PROT_EXECUTE) && (access & L2_NX_BIT)))
+        goto unlock_pv;
+    phys_attribute_set(pn, PMAP_OSPTE_TYPE_REFERENCED);
+    access &= ~PMAP_FAULT_REF;
+    if (fault_type & VM_PROT_WRITE) {
+        phys_attribute_set(pn, PMAP_OSPTE_TYPE_MODIFIED);
+        access &= ~PMAP_FAULT_MOD;
+    }
+    pte = (pte & ~PMAP_ACCESS_MASK) | (access & PMAP_ACCESS_MASK);
+    if (access & PMAP_FAULT_MOD)
+        pte |= L2_ACCESS_APX;
+    entry->fault_access = access;
+    *ptep = pte;
+    arm_drain_writebuf();
+    pmap_flush_tlbs(pmap, va, va + PAGE_SIZE);
+    result = KERN_SUCCESS;
+ unlock_pv:
+    UNLOCK_PVH(pn);
+ unlock_pmap:
+    PMAP_UNLOCK(pmap);
+    return result;
+#endif
 }
 
 /**
@@ -1723,48 +2038,43 @@ void pmap_change_wiring(pmap_t map, vm_map_offset_t va, boolean_t wired)
     leo_change_wiring(map,va,wired);return;
 #else
     pt_entry_t *pte;
-    uint32_t pa;
-
-    /*
-     * Lock the pmap.
-     */
+    ppnum_t pn;
+    pv_rooted_entry_t entry;
+    boolean_t managed;
     PMAP_LOCK(map);
-
-    if ((pte = (pt_entry_t *)pmap_pte(map, va)) == (pt_entry_t *) 0)
-        panic("pmap_change_wiring: pte missing");
-
-    /*
-     * Use FVTP to get the physical PPN. This will not work with the old
-     * pmap_extract.
-     */
-    PMAP_UNLOCK(map);
-    pa = pmap_extract(map, va);
-    PMAP_LOCK(map);
-    assert(pa);
-
-    if (wired && phys_attribute_test(pa >> PAGE_SHIFT, PMAP_OSPTE_TYPE_WIRED)) {
-        /*
-         * We are wiring down the mapping.
-         */
-        pmap_ledger_credit(map, task_ledgers.wired_mem, PAGE_SIZE);
-        OSAddAtomic(+1, &map->pm_stats.wired_count);
-        phys_attribute_set(pa >> PAGE_SHIFT, PMAP_OSPTE_TYPE_WIRED);
-    } else {
-        /*
-         * Unwiring the mapping.
-         */
-        assert(map->pm_stats.wired_count >= 1);
-        OSAddAtomic(-1, &map->pm_stats.wired_count);
-        phys_attribute_clear(pa >> PAGE_SHIFT, PMAP_OSPTE_TYPE_WIRED);
-        pmap_ledger_debit(map, task_ledgers.wired_mem, PAGE_SIZE);
+    pte = (pt_entry_t *)pmap_pte(map, va);
+    if (!pte || !(*pte & ARM_PTE_DESCRIPTOR_4K))
+        panic("pmap_change_wiring: valid PTE missing");
+    pn = pa_index(*pte & L2_ADDR_MASK);
+    if (!pmap_initialized) {
+        pmap_boot_mapping_enter(map, va, wired);
+        PMAP_UNLOCK(map);
+        return;
     }
-
-    /*
-     * Done, unlock the map.
-     */
+    managed = pmap_valid_page(pn);
+    if (managed)
+        LOCK_PVH(pn);
+    entry = pmap_find_pv(map, pn, va);
+    if (!entry)
+        panic("pmap_change_wiring: PV entry missing");
+    if (wired) {
+        /* A wired mapping must no longer depend on pageable VM faults. */
+        *pte = (*pte & ~PMAP_ACCESS_MASK) | (entry->fault_access & PMAP_ACCESS_MASK);
+        entry->fault_access &= ~(PMAP_FAULT_REF | PMAP_FAULT_MOD);
+        if (managed) {
+            phys_attribute_set(pn, PMAP_OSPTE_TYPE_REFERENCED);
+            if (!(entry->fault_access & L2_ACCESS_APX))
+                phys_attribute_set(pn, PMAP_OSPTE_TYPE_MODIFIED);
+        }
+        arm_drain_writebuf();
+        pmap_flush_tlbs(map, va, va + PAGE_SIZE);
+    }
+    pmap_mapping_wire(entry, wired);
+    if (managed) {
+        pmap_wire_refresh(pn);
+        UNLOCK_PVH(pn);
+    }
     PMAP_UNLOCK(map);
-    return;
-
 #endif
 }
 
@@ -1966,16 +2276,51 @@ void pmap_zero_page(ppnum_t p)
  */
 void pmap_clear_refmod(ppnum_t pn, unsigned int mask)
 {
-#if BOARD_CONFIG_QSD8250_LEO
-    /* VM ref/mod API bits are not the ARM physical-attribute bit layout. */
     unsigned int bits = 0;
+    pv_rooted_entry_t head, entry;
     if (mask & VM_MEM_MODIFIED)
         bits |= PMAP_OSPTE_TYPE_MODIFIED;
     if (mask & VM_MEM_REFERENCED)
         bits |= PMAP_OSPTE_TYPE_REFERENCED;
+    if (!bits || !pmap_initialized || !pmap_valid_page(pn))
+        return;
+#if BOARD_CONFIG_QSD8250_LEO
     phys_attribute_clear(pn, bits);
+    return;
 #else
-    phys_attribute_clear(pn, mask);
+
+    LOCK_PVH(pn);
+    head = pai_to_pvh(pn);
+    /* Wired/kernel aliases cannot take pageable VM faults. Keep their history. */
+    if (head->flags & PMAP_OSPTE_TYPE_WIRED)
+        goto done;
+    if (head->pmap != PMAP_NULL) {
+        entry = head;
+        do {
+            if (entry->pmap == kernel_pmap)
+                goto done;
+            entry = (pv_rooted_entry_t)queue_next(&entry->qlink);
+        } while (entry != head);
+        entry = head;
+        do {
+            pt_entry_t *pte = (pt_entry_t *)pmap_pte(entry->pmap, entry->va);
+            if (!pte || !(*pte & ARM_PTE_DESCRIPTOR_4K))
+                panic("pmap_clear_refmod: missing PV mapping");
+            if (bits & PMAP_OSPTE_TYPE_REFERENCED) {
+                entry->fault_access |= PMAP_FAULT_REF;
+                *pte &= ~PMAP_ACCESS_MASK;
+            } else
+                *pte |= L2_ACCESS_APX;
+            if (bits & PMAP_OSPTE_TYPE_MODIFIED)
+                entry->fault_access |= PMAP_FAULT_MOD;
+            arm_drain_writebuf();
+            pmap_flush_tlbs(entry->pmap, entry->va, entry->va + PAGE_SIZE);
+            entry = (pv_rooted_entry_t)queue_next(&entry->qlink);
+        } while (entry != head);
+    }
+    phys_attribute_clear(pn, bits);
+ done:
+    UNLOCK_PVH(pn);
 #endif
 }
 
@@ -2121,7 +2466,7 @@ void pmap_set_modify(ppnum_t pn)
  */
 void pmap_clear_modify(ppnum_t pn)
 {
-    phys_attribute_clear(pn, PMAP_OSPTE_TYPE_MODIFIED);
+    pmap_clear_refmod(pn, VM_MEM_MODIFIED);
 }
 
 /**
@@ -2131,7 +2476,7 @@ void pmap_clear_modify(ppnum_t pn)
  */
 void pmap_clear_reference(ppnum_t pn)
 {
-    phys_attribute_clear(pn, PMAP_OSPTE_TYPE_REFERENCED);
+    pmap_clear_refmod(pn, VM_MEM_REFERENCED);
 }
 
 /**
@@ -2151,8 +2496,8 @@ void pmap_set_reference(ppnum_t pn)
  */
 boolean_t pmap_valid_page(ppnum_t p)
 {
-    return (((p << PAGE_SHIFT) > avail_start)
-            && ((p << PAGE_SHIFT) < avail_end));
+    uint64_t pa = (uint64_t)p << PAGE_SHIFT;
+    return (pa >= avail_start && pa < avail_end);
 }
 
 /**
@@ -2185,10 +2530,16 @@ boolean_t pmap_verify_free(vm_offset_t phys)
  * Invalidates all of the instruction cache on a physical page and
  * pushes any dirty data from the data cache for the same physical page
  */
-void pmap_sync_page_data_phys(__unused ppnum_t pa)
+void pmap_sync_page_data_phys(ppnum_t pa)
 {
-    Debugger("pmap_sync_page_data_phys");
-    return;
+    uint64_t physical = (uint64_t)pa << PAGE_SHIFT;
+    if (physical >= gPhysBase && mem_size >= PAGE_SIZE &&
+        physical - gPhysBase <= mem_size - PAGE_SIZE) {
+        arm_icache_sync_range(phys_to_virt((vm_offset_t)physical), PAGE_SIZE);
+    } else {
+        /* No linear mapping: publish dirty data before invalidating I-cache. */
+        arm_icache_sync_all();
+    }
 }
 
 /**
@@ -3160,6 +3511,47 @@ void pmap_expand(pmap_t map, vm_offset_t v)
  * Create a translation entry for a PA->VA mappings with additional options.
  * Called from vm_fault.
  */
+/* Re-establish access history whenever VM publishes a managed mapping.
+ * Clean writable pages stay read-only until the first actual write fault. */
+static uint32_t pmap_enter_refmod(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm_prot_t prot,
+                                 vm_prot_t fault_type, boolean_t wired,
+                                 uint32_t pte)
+{
+#if !BOARD_CONFIG_QSD8250_LEO
+    pv_rooted_entry_t entry;
+#endif
+#if !BOARD_CONFIG_QSD8250_LEO
+    if (!pmap_initialized)
+        pmap_boot_mapping_enter(pmap, va, wired);
+#endif
+    if (pmap_initialized) {
+#if !BOARD_CONFIG_QSD8250_LEO
+        entry = pmap_find_pv(pmap, pa, va);
+        if (!entry)
+            panic("pmap_enter_refmod: missing PV entry");
+        entry->fault_access = (entry->fault_access & PMAP_MAPPING_WIRED) |
+                              (pte & (PMAP_ACCESS_MASK | L2_NX_BIT));
+        pmap_mapping_wire(entry, wired);
+        if (pmap_valid_page(pa))
+            pmap_wire_refresh(pa);
+#endif
+    }
+    if (pmap_initialized && pmap_valid_page(pa)) {
+        phys_attribute_set(pa, PMAP_OSPTE_TYPE_REFERENCED);
+        if (prot & VM_PROT_WRITE) {
+            if ((fault_type & VM_PROT_WRITE) || wired || pmap == kernel_pmap)
+                phys_attribute_set(pa, PMAP_OSPTE_TYPE_MODIFIED);
+            else if (!phys_attribute_test(pa, PMAP_OSPTE_TYPE_MODIFIED)) {
+                pte |= L2_ACCESS_APX;
+#if !BOARD_CONFIG_QSD8250_LEO
+                entry->fault_access |= PMAP_FAULT_MOD;
+#endif
+            }
+        }
+    }
+    return pte;
+}
+
 kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm_prot_t prot, vm_prot_t fault_type, unsigned int flags, boolean_t wired, unsigned int options)
 {
 #if BOARD_CONFIG_QSD8250_LEO
@@ -3205,8 +3597,15 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
      */
     while ((pte = (pt_entry_t)pmap_pte(pmap, va)) == 0) {
         PMAP_UNLOCK(pmap);
+        if (options & PMAP_OPTIONS_NOWAIT)
+            return KERN_RESOURCE_SHORTAGE;
         pmap_expand(pmap, va);
         PMAP_LOCK(pmap);
+    }
+
+    if (options & PMAP_OPTIONS_NOENTER) {
+        PMAP_UNLOCK(pmap);
+        return KERN_SUCCESS;
     }
 
     /*
@@ -3217,7 +3616,8 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
     /*
      * If it's a managed page, lock the pv entry right now.
      */
-    if((old_pte & L2_ADDR_MASK) != 0) {
+    if (pmap_initialized && (old_pte & ARM_PTE_DESCRIPTOR_4K) &&
+        pmap_valid_page(pa_index(old_pte & L2_ADDR_MASK))) {
         uint32_t pai = pa_index(old_pte & L2_ADDR_MASK);
         LOCK_PVH(pai);
         old_pvh_locked = TRUE;
@@ -3228,12 +3628,9 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
         }
     }
 
-    if ((old_pte & L2_ADDR_MASK) == (pa << PAGE_SHIFT)) {
-        /*
-         * !!! IMPLEMENT 'pmap_vm_prot_to_page_flags' !!!
-         * XXX protection is not implemented right now, all pages are 'RWX'.
-         */
-
+    if ((old_pte & ARM_PTE_DESCRIPTOR_4K) &&
+        (old_pte & L2_ADDR_MASK) == (pa << PAGE_SHIFT) &&
+        (!pmap_initialized || pmap_valid_page(pa) || pmap_find_pv(pmap, pa, va))) {
         uint32_t template_pte = ((pa << PAGE_SHIFT) & L2_ADDR_MASK) | L2_SMALL_PAGE;
         template_pte |= pmap_vm_prot_to_page_flags(pmap, prot, wired, 0);
 
@@ -3249,18 +3646,7 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
          */
         template_pte |= pmap_get_cache_attributes(pa);
 
-        if (wired) {
-            if (!phys_attribute_test(pa, PMAP_OSPTE_TYPE_WIRED)) {
-                OSAddAtomic(+1, &pmap->pm_stats.wired_count);
-                phys_attribute_set(pa, PMAP_OSPTE_TYPE_WIRED);
-                pmap_ledger_credit(pmap, task_ledgers.wired_mem, PAGE_SIZE);
-            } else {
-                assert(pmap->pm_stats.wired_count >= 1);
-                OSAddAtomic(-1, &pmap->pm_stats.wired_count);
-                pmap_ledger_debit(pmap, task_ledgers.wired_mem, PAGE_SIZE);
-            }
-        }
-
+        template_pte = pmap_enter_refmod(pmap, va, pa, prot, fault_type, wired, template_pte);
         *(uint32_t *) pte = template_pte;
 
         /*
@@ -3282,52 +3668,68 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
     if (pmap_initialized) {
         ppnum_t pai;
 
-        /*
-         * If the current PA isn't zero, and if it's non-existent... remove the mapping
-         */
-        if ((old_pte & L2_ADDR_MASK) != 0) {
-            pai = pa_index((old_pte & L2_ADDR_MASK));
-            pv_h = pai_to_pvh(pai);
+        /* Remove the existing descriptor and its managed-page PV entry. */
+        if (old_pte & ARM_PTE_DESCRIPTOR_4K) {
+            pai = pa_index(old_pte & L2_ADDR_MASK);
+            *(uint32_t *)pte = 0;
 
-            *(uint32_t *) pte = 0;
-
-            if (!pmap_valid_page(pa))
-                goto EnterPte;
-
-            /*
-             * Set statistics and credit/debit internal pmap ledgers
-             */
-            {
+            pv_rooted_entry_t old_entry = pmap_find_pv(pmap, pai, va);
+            /* Only the kernel may have raw bootstrap I/O mappings. */
+            if (!old_entry && pmap != kernel_pmap)
+                panic("pmap_enter_options: old user PV entry missing");
+            if (old_entry) {
                 pmap_ledger_debit(pmap, task_ledgers.phys_mem, PAGE_SIZE);
                 assert(pmap->pm_stats.resident_count >= 1);
                 OSAddAtomic(-1, &pmap->pm_stats.resident_count);
             }
 
-            if (phys_attribute_test(pa, PMAP_OSPTE_TYPE_WIRED)) {
-                assert(pmap->pm_stats.wired_count >= 1);
-                OSAddAtomic(-1, &pmap->pm_stats.wired_count);
-                phys_attribute_clear(pa, PMAP_OSPTE_TYPE_WIRED);
+            if (pmap_valid_page(pai)) {
+                pv_h = pai_to_pvh(pai);
+                if (!old_entry)
+                    panic("pmap_enter_options: old PV entry missing");
+                pmap_mapping_wire(old_entry, FALSE);
+                pmap_wire_refresh(pai);
+                if (pv_h->pmap == PMAP_NULL)
+                    panic("pmap_enter_options: null pv_list\n");
+                pvh_e = pmap_pv_remove(pmap, va, &pai, 0);
+                if (old_pvh_locked) {
+                    UNLOCK_PVH(pai);
+                    old_pvh_locked = FALSE;
+                }
+            } else if (old_entry) {
+                pmap_mapping_wire(old_entry, FALSE);
+                pvh_e = (pv_hashed_entry_t)old_entry;
+                pv_hash_remove(pvh_e);
             }
-
-            if (pv_h->pmap == PMAP_NULL) {
-                panic("pmap_enter_options: null pv_list\n");
-            }
-            pvh_e = pmap_pv_remove(pmap, va, (ppnum_t *) & pai, 0);
-
-            /*
-             * Unlock the old pvh since it's gone now
-             */
-            if(old_pvh_locked) {
-                UNLOCK_PVH(pai);
-                old_pvh_locked = FALSE;
-            }
+            /* Retire stale translations before an allocation can drop the lock. */
+            arm_drain_writebuf();
+            pmap_flush_tlbs(pmap, va, va + PAGE_SIZE);
         }
 
+        if (!pmap_valid_page(pa)) {
+            if (!pvh_e && pvh_new) {
+                pvh_e = pvh_new;
+                pvh_new = PV_HASHED_ENTRY_NULL;
+            }
+            if (!pvh_e) {
+                PV_HASHED_ALLOC(pvh_e);
+                if (!pvh_e && pmap == kernel_pmap) {
+                    PV_HASHED_KERN_ALLOC(pvh_e);
+                }
+            }
+            if (!pvh_e) {
+                PMAP_UNLOCK(pmap);
+                if (options & PMAP_OPTIONS_NOWAIT)
+                    return KERN_RESOURCE_SHORTAGE;
+                pvh_new = (pv_hashed_entry_t)zalloc(pv_hashed_list_zone);
+                goto Retry;
+            }
+            pmap_unmanaged_pv_add(pmap, va, pa, pvh_e);
+            pvh_e = PV_HASHED_ENTRY_NULL;
+            goto EnterPte;
+        }
         pai = pa;
         pv_h = pai_to_pvh(pai);
-
-        if (!pmap_valid_page(pa))
-            goto EnterPte;
 
 #if 0
         /*
@@ -3358,8 +3760,7 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
             pv_h->va = va;
             pv_h->pmap = pmap;
             queue_init(&pv_h->qlink);
-            if (wired)
-                phys_attribute_set(pa, PMAP_OSPTE_TYPE_WIRED);
+            pv_h->fault_access = 0;
         } else {
             /*
              *  Add new pv_hashed_entry after header.
@@ -3384,17 +3785,26 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
                     } else {
                         UNLOCK_PVH(pai);
                         PMAP_UNLOCK(pmap);
+                        if (options & PMAP_OPTIONS_NOWAIT)
+                            return KERN_RESOURCE_SHORTAGE;
                         pvh_new = (pv_hashed_entry_t) zalloc(pv_hashed_list_zone);
                         goto Retry;
                     }
                 }
             }
 
-            if (PV_HASHED_ENTRY_NULL == pvh_e)
+            if (PV_HASHED_ENTRY_NULL == pvh_e) {
+                if (options & PMAP_OPTIONS_NOWAIT) {
+                    UNLOCK_PVH(pai);
+                    PMAP_UNLOCK(pmap);
+                    return KERN_RESOURCE_SHORTAGE;
+                }
                 panic("Mapping alias chain exhaustion, possibly induced by numerous kernel virtual double mappings");
+            }
             pvh_e->va = va;
             pvh_e->pmap = pmap;
             pvh_e->ppn = pa;
+            pvh_e->fault_access = 0;
 
             pv_hash_add(pvh_e, pv_h);
 
@@ -3409,14 +3819,9 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
     }
  EnterPte:
 
-    /*
-     * Enter and count the mapping.
-     */
-    pmap->pm_stats.resident_count++;
-    pmap_ledger_credit(pmap, task_ledgers.phys_mem, PAGE_SIZE);
-
-    if (wired) {
-        pmap->pm_stats.wired_count++;
+    /* Bootstrap mappings are counted once by pmap_enter_refmod. */
+    if (pmap_initialized) {
+        pmap->pm_stats.resident_count++;
         pmap_ledger_credit(pmap, task_ledgers.phys_mem, PAGE_SIZE);
     }
 
@@ -3441,6 +3846,7 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
      */
     template_pte |= pmap_get_cache_attributes(pa);
 
+    template_pte = pmap_enter_refmod(pmap, va, pa, prot, fault_type, wired, template_pte);
     *(uint32_t *) pte = template_pte;
 
     /* 
@@ -3454,6 +3860,7 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
     /*
      * Done, now invalidate the TLB for a single page.
      */
+    arm_drain_writebuf();
     pmap_flush_tlbs(pmap, va, va + PAGE_SIZE);
 
     if (pvh_e != PV_HASHED_ENTRY_NULL) {
@@ -3532,11 +3939,7 @@ void pmap_init(void)
      */
     uint32_t npages = (mem_size / PAGE_SIZE);
     pv_head_hash_table = (pv_rooted_entry_t) pv_root;
-#if BOARD_CONFIG_QSD8250_LEO
     pv_root = (vm_offset_t) (pv_head_hash_table + npages);
-#else
-    pv_root = (vm_offset_t) (pv_head_table + npages);
-#endif
 
     pv_hash_table = (pv_hashed_entry_t *) pv_root;
     pv_root = (vm_offset_t) (pv_hash_table + (npvhash + 1));
@@ -3668,6 +4071,9 @@ void pmap_init(void)
     /*
      * Done initializing. 
      */
+#if !BOARD_CONFIG_QSD8250_LEO
+    pmap_bootstrap_pv();
+#endif
     pmap_initialized = TRUE;
 
     return;
@@ -3709,23 +4115,55 @@ void pmap_remove_range(pmap_t pmap, vm_map_offset_t start_vaddr, pt_entry_t * sp
         /*
          * Get the index for the PV table.
          */
+        if (!(*cpte & ARM_PTE_DESCRIPTOR_4K))
+            continue;
         ppnum_t pai = pa_index(*cpte & L2_ADDR_MASK);
-        if (pai == 0) {
+        if (!pmap_initialized) {
+            unsigned int state = pmap_boot_mapping_remove(pmap, vaddr);
+            if (state & PMAP_BOOT_PRESENT)
+                num_removed++;
+            if (state & PMAP_BOOT_WIRED)
+                num_unwired++;
+            *cpte = 0;
             continue;
         }
+
 
         /* Unmanaged I/O RAM has no pv_table entry, but its PTE and resident
          * accounting still belong to this pmap and must be removed. */
         if (!pmap_valid_page(pai)) {
-            num_removed++;
+            pv_rooted_entry_t entry = pmap_initialized ? pmap_find_pv(pmap, pai, vaddr) : PV_ROOTED_ENTRY_NULL;
+            if (entry) {
+                if (entry->fault_access & PMAP_MAPPING_WIRED)
+                    num_unwired++;
+                pvh_e = (pv_hashed_entry_t)entry;
+                pv_hash_remove(pvh_e);
+                pvh_e->qlink.next = (queue_entry_t)pvh_eh;
+                pvh_eh = pvh_e;
+                if (!pvh_et)
+                    pvh_et = pvh_e;
+                pvh_cnt++;
+                num_removed++;
+            } else if (!pmap_initialized) {
+                num_removed++;
+            } else if (pmap != kernel_pmap) {
+                panic("pmap_remove_range: unmanaged user PV entry missing");
+            }
             *cpte = 0;
             continue;
         }
 
         num_removed++;
-        if (phys_attribute_test(pai, PMAP_OSPTE_TYPE_WIRED)) {
-            phys_attribute_clear(pai, PMAP_OSPTE_TYPE_WIRED);
-            num_unwired++;
+        if (pmap_initialized) {
+            pv_rooted_entry_t entry;
+            LOCK_PVH(pai);
+            entry = pmap_find_pv(pmap, pai, vaddr);
+            if (!entry)
+                panic("pmap_remove_range: PV entry missing");
+            if (entry->fault_access & PMAP_MAPPING_WIRED) {
+                entry->fault_access &= ~PMAP_MAPPING_WIRED;
+                num_unwired++;
+            }
         }
 
         /*
@@ -3739,13 +4177,13 @@ void pmap_remove_range(pmap_t pmap, vm_map_offset_t start_vaddr, pt_entry_t * sp
         if (!pmap_initialized)
             continue;
 
-        LOCK_PVH(pai);
         /*
          *  Remove the mapping from the pvlist for
          *  this physical page.
          */
         {
             pvh_e = pmap_pv_remove(pmap, vaddr, (ppnum_t *) & pai, cpte);
+            pmap_wire_refresh(pai);
             UNLOCK_PVH(pai);
             if (pvh_e != PV_HASHED_ENTRY_NULL) {
                 pvh_e->qlink.next = (queue_entry_t) pvh_eh;
@@ -3766,6 +4204,7 @@ void pmap_remove_range(pmap_t pmap, vm_map_offset_t start_vaddr, pt_entry_t * sp
     /*
      * Invalidate all TLBs.
      */
+    arm_drain_writebuf();
     pmap_flush_tlbs(pmap, start_vaddr, vaddr);
 
     /*
@@ -3797,7 +4236,11 @@ void pmap_remove(pmap_t map, vm_offset_t sva, vm_offset_t eva)
 {
     spl_t spl;
     pt_entry_t *tte;
-    vm_offset_t *spte, *epte, lva = sva;
+    pt_entry_t *spte, *epte;
+    vm_offset_t lva = sva, orig_sva = sva;
+
+    if (map == PMAP_NULL || sva >= eva)
+        return;
 
     /*
      * Verify the pages are page aligned.
@@ -3810,28 +4253,18 @@ void pmap_remove(pmap_t map, vm_offset_t sva, vm_offset_t eva)
      */
     PMAP_LOCK(map);
 
-    /*
-     * This is broken.
-     */
+    /* Walk one L2 table at a time. */
     while (sva < eva) {
         lva = (sva + _1MB) & ~((_1MB) - 1);
-        if (lva > eva)
+        if (lva <= sva || lva > eva)
             lva = eva;
         tte = (pt_entry_t *)pmap_tte(map, sva);
         assert(tte);
         if (tte && ((*tte & ARM_PAGE_MASK_VALUE) == ARM_PAGE_PAGE_TABLE)) {
             pt_entry_t *spte_begin;
             spte_begin = (pt_entry_t *) (phys_to_virt(L1_PTE_ADDR(*tte)));
-            spte = (vm_offset_t *)((vm_offset_t) spte_begin + (vm_offset_t) pte_offset(sva));
-            epte = (vm_offset_t *)((vm_offset_t) spte_begin + (vm_offset_t) pte_offset(lva));
-
-            /*
-             * If the addresses are more than one 1MB apart, well...
-             */
-            if ((sva >> L1SHIFT) != (lva >> L1SHIFT)) {
-                int mb_off = (lva >> L1SHIFT) - (sva >> L1SHIFT);
-                epte = (vm_offset_t *)((vm_offset_t) spte_begin + (0x400 * mb_off) + (vm_offset_t) pte_offset(lva));
-            }
+            spte = (pt_entry_t *)((vm_offset_t) spte_begin + pte_offset(sva));
+            epte = spte + ((lva - sva) >> PAGE_SHIFT);
 
             assert(epte >= spte);
 
@@ -3850,7 +4283,8 @@ void pmap_remove(pmap_t map, vm_offset_t sva, vm_offset_t eva)
     /*
      * Flush TLBs since we modified page table entries.
      */
-    pmap_flush_tlbs(map, sva, eva);
+    arm_drain_writebuf();
+    pmap_flush_tlbs(map, orig_sva, eva);
 
     /*
      * Return. 
@@ -4003,10 +4437,14 @@ void pmap_page_protect(ppnum_t pn, vm_prot_t prot)
                  */
 #if BOARD_CONFIG_QSD8250_LEO
                 leo_mapping_wire(pv_e,FALSE);
+#else
+                pmap_mapping_wire(pv_e,FALSE);
 #endif
                 *(pt_entry_t *) pte = 0;
                 pmap_flush_tlbs(pmap, vaddr, vaddr + PAGE_SIZE);
-                phys_attribute_clear(pn, PMAP_OSPTE_TYPE_REFERENCED | PMAP_OSPTE_TYPE_MODIFIED);
+                /* Reference/modify history belongs to the physical page,
+                 * not this mapping. pmap_disconnect reads it after removal;
+                 * only the explicit clear APIs may discard that history. */
                 if (pmap->pm_stats.resident_count < 1)
                     panic("pmap_page_protect: resident_count");
                 assert(pmap->pm_stats.resident_count >= 1);
@@ -4042,6 +4480,11 @@ void pmap_page_protect(ppnum_t pn, vm_prot_t prot)
                  * Write-protect.
                  */
                 *(pt_entry_t *) pte |= (L2_ACCESS_APX);
+#if !BOARD_CONFIG_QSD8250_LEO
+                pv_e->fault_access |= L2_ACCESS_APX;
+                pv_e->fault_access &= ~PMAP_FAULT_MOD;
+#endif
+                arm_drain_writebuf();
                 pmap_flush_tlbs(pmap, vaddr, vaddr + PAGE_SIZE);
             }
 
@@ -4059,6 +4502,9 @@ void pmap_page_protect(ppnum_t pn, vm_prot_t prot)
                 pv_hash_remove(pvh_e);
                 pv_h->pmap = pvh_e->pmap;
                 pv_h->va = pvh_e->va;
+#if !BOARD_CONFIG_QSD8250_LEO
+                pv_h->fault_access = pvh_e->fault_access;
+#endif
 #if BOARD_CONFIG_QSD8250_LEO
             pv_h->mapping_wired = pvh_e->mapping_wired;
 #endif
@@ -4076,6 +4522,8 @@ void pmap_page_protect(ppnum_t pn, vm_prot_t prot)
     }
 #if BOARD_CONFIG_QSD8250_LEO
     leo_physical_wire_refresh(pn);
+#else
+    pmap_wire_refresh(pn);
 #endif
     UNLOCK_PVH(pn);
 }
@@ -4213,7 +4661,6 @@ void pmap_protect(pmap_t map, vm_map_offset_t sva, vm_map_offset_t eva, vm_prot_
     vm_map_offset_t lva;
     vm_map_offset_t orig_sva;
     boolean_t set_NX;
-    int num_found = 0;
 
     /*
      * Verify the start and end are page aligned. 
@@ -4224,10 +4671,19 @@ void pmap_protect(pmap_t map, vm_map_offset_t sva, vm_map_offset_t eva, vm_prot_
     /*
      * Remove PTEs if they're set to VM_PROT_NONE.
      */
-    if (map == PMAP_NULL)
+    if (map == PMAP_NULL || sva >= eva)
         return;
 
-    if (prot == VM_PROT_NONE) {
+    /* XNU ARM pmap_protect does not grant write access. Full/RW
+     * requests leave mappings alone; other unsupported protections remove. */
+    switch (prot) {
+    case VM_PROT_READ:
+    case VM_PROT_READ | VM_PROT_EXECUTE:
+        break;
+    case VM_PROT_READ | VM_PROT_WRITE:
+    case VM_PROT_ALL:
+        return;
+    default:
         pmap_remove(map, sva, eva);
         return;
     }
@@ -4235,7 +4691,7 @@ void pmap_protect(pmap_t map, vm_map_offset_t sva, vm_map_offset_t eva, vm_prot_
     /*
      * Enforce NX if necessary.
      */
-    if ((prot & VM_PROT_EXECUTE) || !nx_enabled)
+    if ((prot & VM_PROT_EXECUTE) || !nx_enabled || !map->pm_nx)
         set_NX = FALSE;
     else
         set_NX = TRUE;
@@ -4245,13 +4701,10 @@ void pmap_protect(pmap_t map, vm_map_offset_t sva, vm_map_offset_t eva, vm_prot_
      */
     PMAP_LOCK(map);
 
-    /*
-     * This is broken.
-     */
     orig_sva = sva;
     while (sva < eva) {
         lva = (sva + _1MB) & ~((_1MB) - 1);
-        if (lva > eva)
+        if (lva <= sva || lva > eva)
             lva = eva;
         tte = (pt_entry_t *)pmap_tte(map, sva);
         assert(tte);
@@ -4277,6 +4730,7 @@ void pmap_protect(pmap_t map, vm_map_offset_t sva, vm_map_offset_t eva, vm_prot_
             if (((vm_offset_t) epte - (vm_offset_t) spte) > L2_SIZE)
                 panic("pmap_protect: attempting to protect bogus PTE range");;
 
+            vm_map_offset_t vaddr = sva;
             while (spte < epte) {
                 if (*spte & ARM_PTE_DESCRIPTOR_4K) {
                     assert(*spte & ARM_PTE_DESCRIPTOR_4K);
@@ -4284,21 +4738,27 @@ void pmap_protect(pmap_t map, vm_map_offset_t sva, vm_map_offset_t eva, vm_prot_
                     /*
                      * Make the PTE RO if necessary.
                      */
-                    if (prot & VM_PROT_WRITE)
-                        *spte &= ~(L2_ACCESS_APX);
-                    else
-                        *spte |= L2_ACCESS_APX;
+                    pt_entry_t template_pte = *spte | L2_ACCESS_APX;
 
                     /*
                      * Enforce NX bit.
                      */
-                    if (set_NX)
-                        *spte |= L2_NX_BIT;
-                    else
-                        *spte &= ~(L2_NX_BIT);
-                    num_found++;
+                    if (set_NX) {
+                        template_pte |= L2_NX_BIT;
+                    } else {
+                        /* iOS 7 ARM synchronizes the physical page before
+                         * publishing an NX-to-executable permission change. */
+                        if (*spte & L2_NX_BIT)
+                            invalidate_icache(*spte & L2_ADDR_MASK, PAGE_SIZE, TRUE);
+                        template_pte &= ~L2_NX_BIT;
+                    }
+#if !BOARD_CONFIG_QSD8250_LEO
+                    pmap_fault_protect(map, vaddr, template_pte);
+#endif
+                    *spte = template_pte;
                 }
                 spte++;
+                vaddr += PAGE_SIZE;
             }
         }
         sva = lva;
@@ -4307,7 +4767,9 @@ void pmap_protect(pmap_t map, vm_map_offset_t sva, vm_map_offset_t eva, vm_prot_
     /*
      * We're done with that, bye.
      */
-    pmap_flush_tlbs(map, sva, eva);
+    /* Publish all descriptor writes before invalidating cached translations. */
+    arm_drain_writebuf();
+    pmap_flush_tlbs(map, orig_sva, eva);
     PMAP_UNLOCK(map);
 
     return;
