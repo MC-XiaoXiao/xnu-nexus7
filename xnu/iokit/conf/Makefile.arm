@@ -2,6 +2,15 @@
 #BEGIN  Machine dependent Makefile fragment for arm
 ######################################################################
 
+# Keep the rest of the ARM port's optimization policy unchanged. The storage
+# transport is a measured hot path; software FP keeps kernel SIMD state safe.
+ifneq ($(KERNEL_CONFIG),DEBUG)
+Tegra30EMMC.cpo_CFLAGS_RM += -O0 -O1 -O3 -Os
+Tegra30EMMC.cpo_CFLAGS_ADD += -O2 -fno-vectorize -fno-slp-vectorize
+endif
+# Make does not otherwise track per-object flag changes.
+Tegra30EMMC.cpo: $(SOURCE_DIR)/iokit/conf/Makefile.arm
+
 ######################################################################
 #END    Machine dependent Makefile fragment for arm
 ######################################################################

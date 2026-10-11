@@ -203,7 +203,7 @@ IOReturn IOInterleavedMemoryDescriptor::prepare(IODirection forDirection)
     {
         for ( unsigned indexUndo = 0; indexUndo < index; indexUndo++ )
         {
-            statusUndo = _descriptors[index]->complete(forDirection);
+            statusUndo = _descriptors[indexUndo]->complete(forDirection);
             assert(statusUndo == kIOReturnSuccess);
         }
     }

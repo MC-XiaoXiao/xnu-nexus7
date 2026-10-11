@@ -2139,9 +2139,11 @@ IOReturn IODeblocker::prepare(IODirection forDirection)
 
     if ( status != kIOReturnSuccess )
     {
-        for ( unsigned indexUndo = 0; indexUndo <= index; indexUndo++ )
+        // Only successful prepares own a wire. The failing chunk must not be
+        // completed, and each earlier chunk must be unwound exactly once.
+        for ( unsigned indexUndo = 0; indexUndo < index; indexUndo++ )
         {
-            statusUndo = _chunks[index].buffer->complete(forDirection);
+            statusUndo = _chunks[indexUndo].buffer->complete(forDirection);
             assert(statusUndo == kIOReturnSuccess);
         }
     }
@@ -2198,7 +2200,9 @@ addr64_t IODeblocker::getPhysicalSegment( IOByteCount   offset,
                                     /* offset  */ offset + _chunks[index].offset,
                                     /* length  */ length,
                                     /* options */ options );
-            if ( length )  *length = min(*length, _chunks[index].length);
+            // A DMA cursor starting inside this chunk must stop at its end,
+            // even when the underlying descriptor has more contiguous bytes.
+            if ( length )  *length = min(*length, _chunks[index].length - offset);
             return address;
         }
         offset -= _chunks[index].length;
