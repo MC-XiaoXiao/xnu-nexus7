@@ -62,7 +62,11 @@ const char * gIOKernelConfigTables =
 "     'IOProbeScore'    = 1:32;"
 "   },"
 "   {"
+#if defined(TEGRA30_CPU)
+"     'IOClass'         = Tegra30CPU;"
+#else
 "     'IOClass'         = AppleARMCPU;"
+#endif
 "     'IONameMatch'     = cpu;"
 "     'IOProviderClass' = IOPlatformDevice;"
 "     'IOProbeScore'    = 1:32;"

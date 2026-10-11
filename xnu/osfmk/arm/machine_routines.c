@@ -65,6 +65,7 @@
  */
 
 #include <arm/machine_routines.h>
+#include <arm/mp.h>
 #include <arm/io_map_entries.h>
 #include <arm/cpu_affinity.h>
 #include <mach/processor.h>
@@ -259,22 +260,35 @@ void ml_init_lock_timeout(void)
     MutexSpin = (unsigned int) abstime;
 }
 
-/**
- * ml_get_max_cpus
- *
- * Since this is a uniprocessor system, we return 0.
- */
+/* CPU discovery runs on an IOKit matching thread. As on Apple's x86 path,
+ * block commpage consumers until the platform publishes the configured limit.
+ * Interrupt exclusion protects the event protocol on this ARM UP port. */
+static boolean_t max_cpus_initialized;
+
 int ml_get_max_cpus(void)
 {
-    return (machine_info.max_cpus);
+    boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
+    while (!max_cpus_initialized) {
+        assert_wait((event_t)&max_cpus_initialized, THREAD_UNINT);
+        thread_block(THREAD_CONTINUE_NULL);
+    }
+    (void)ml_set_interrupts_enabled(interrupts);
+    return machine_info.max_cpus;
 }
 
 void ml_init_max_cpus(unsigned long max_cpus)
 {
-    machine_info.max_cpus = max_cpus;
-    machine_info.physical_cpu_max = max_cpus;
-    machine_info.logical_cpu_max = max_cpus;
-    return;
+    boolean_t interrupts = ml_set_interrupts_enabled(FALSE);
+    if (!max_cpus_initialized) {
+        if (max_cpus == 0 || max_cpus > MAX_CPUS)
+            panic("Invalid platform CPU count: %lu", max_cpus);
+        machine_info.max_cpus = max_cpus;
+        machine_info.physical_cpu_max = max_cpus;
+        machine_info.logical_cpu_max = max_cpus;
+        max_cpus_initialized = TRUE;
+        thread_wakeup((event_t)&max_cpus_initialized);
+    }
+    (void)ml_set_interrupts_enabled(interrupts);
 }
 
 void ml_install_interrupt_handler(void *nub, int source, void *target,

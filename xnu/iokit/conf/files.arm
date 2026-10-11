@@ -48,4 +48,5 @@ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_sdcc.c standard
 iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/fat_locator.c standard
 
 # Tegra30 SoC drivers
+iokit/Drivers/KernelBuiltIn/ARM/Tegra30/Tegra30CPU.cpp optional iokitcpp tegra30_cpu
 iokit/Drivers/KernelBuiltIn/ARM/Tegra30/Tegra30EMMC.cpp optional iokitcpp tegra30_emmc

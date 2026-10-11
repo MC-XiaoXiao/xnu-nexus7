@@ -7,6 +7,9 @@
 //
 
 #include "AppleARMCPU.h"
+#if defined(BOARD_CONFIG_TEGRA30_NEXUS7)
+#include <arm/mp.h>
+#endif
 
 #define super IOCPU
 OSDefineMetaClassAndStructors(AppleARMCPU, IOCPU);
@@ -39,7 +42,12 @@ bool AppleARMCPU::start(IOService * provider)
         panic("Failed to alloc class for dumb interrupt controller, we suck hard");
     }
 
-#if defined(BOARD_CONFIG_QSD8250_LEO) || defined(BOARD_CONFIG_TEGRA30_NEXUS7)
+#if defined(BOARD_CONFIG_TEGRA30_NEXUS7)
+    /* Only registered Mach CPUs have an interrupt delivery path. The DT
+     * topology limit is published by Tegra30CPU before this UP controller. */
+    if (gIC->initCPUInterruptController(real_ncpus) != kIOReturnSuccess || !gIC->attach(this))
+        panic("Tegra30 CPU interrupt-controller initialization failed");
+#elif defined(BOARD_CONFIG_QSD8250_LEO)
     if (gIC->initCPUInterruptController(1) != kIOReturnSuccess || !gIC->attach(this))
         panic("Leo CPU interrupt-controller initialization failed");
 #else

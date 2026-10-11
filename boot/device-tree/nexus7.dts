@@ -11,7 +11,26 @@
     cpus {
         cpu0 {
             compatible = "arm,cortex-a9";
+            state = "running";
             timebase-frequency = <0xf4240>;
+        };
+        cpu1 {
+            device_type = "cpu";
+            compatible = "arm,cortex-a9";
+            reg = <0x1>;
+            state = "stopped";
+        };
+        cpu2 {
+            device_type = "cpu";
+            compatible = "arm,cortex-a9";
+            reg = <0x2>;
+            state = "stopped";
+        };
+        cpu3 {
+            device_type = "cpu";
+            compatible = "arm,cortex-a9";
+            reg = <0x3>;
+            state = "stopped";
         };
     };
     arm-io {
