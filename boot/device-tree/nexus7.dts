@@ -34,6 +34,14 @@
         };
     };
     arm-io {
+        pmc {
+            compatible = "nvidia,tegra30-pmc";
+            reg = <0x7000e400 0x400>;
+        };
+        watchdog {
+            compatible = "nvidia,tegra30-watchdog";
+            reg = <0x60005000 0x1000>;
+        };
         emmc {
             compatible = "nvidia,tegra30-sdmmc4-emmc";
             reg = <0x78000600 0x200 0x60006000 0x1000>;

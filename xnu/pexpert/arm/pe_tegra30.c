@@ -13,16 +13,17 @@
 #include <machine/machine_routines.h>
 #include <arm/pmap.h>
 #include <kern/debug.h>
+#include <IOKit/IOPlatformExpert.h>
 
 /* Android grouper defaults to UARTD. Override at compile time for UARTA pads. */
 #ifndef NEXUS7_UART_PHYS
 #define NEXUS7_UART_PHYS 0x70006300U
 #endif
-static uint32_t timer_phys, gicd_phys, gicc_phys, lic_phys, uart_phys;
+static uint32_t timer_phys, gicd_phys, gicc_phys, lic_phys, uart_phys, pmc_phys;
 #define TIMER_IRQ 32U /* TIMER1 = GIC SPI 0 */
 #define TICK_US 10000U
 #define REG(b, o) (*(volatile uint32_t *)((b) + (o)))
-static vm_offset_t uart_base, timer_base, gicd_base, gicc_base, lic_base;
+static vm_offset_t uart_base, timer_base, gicd_base, gicc_base, lic_base, pmc_base;
 static uint32_t last_usec;
 static uint64_t elapsed_usec;
 static boolean_t clock_ready;
@@ -57,6 +58,10 @@ void tegra30_dt_init(void)
     dt_cells("/arm-io/timer", "reg", reg, 2);
     if ((reg[0]&0xfff) || reg[1]!=0x1000) panic("Tegra30 DT: invalid timer range");
     timer_phys = reg[0];
+    dt_cells("/arm-io/pmc", "reg", reg, 2);
+    if (reg[0] != 0x7000e400U || reg[1] != 0x400)
+        panic("Tegra30 DT: invalid PMC range");
+    pmc_phys = reg[0];
     dt_cells("/arm-io/timer", "interrupts", &irq, 1);
     if (irq != TIMER_IRQ) panic("Tegra30 DT: only TIMER1 IRQ is supported");
     dt_cells("/arm-io/interrupt-controller", "reg", reg, 4);
@@ -75,6 +80,36 @@ void tegra30_dt_init(void)
 }
 
 static void io_sync(void) { __asm__ volatile("dsb sy" ::: "memory"); }
+static int tegra_halt_restart(unsigned int type)
+{
+    switch (type) {
+    case kPERestartCPU:
+    case kPEPanicRestartCPU:
+    case kPEHaltCPU:
+    case kPEHangCPU:
+        break;
+    default:
+        return 0;
+    }
+    /* UP: exclude both the feeder and interrupts. This path cannot depend on
+     * IOKit, locks, allocation, a working scheduler, or the watchdog driver. */
+    ml_set_interrupts_enabled(FALSE);
+    if (type == kPERestartCPU || type == kPEPanicRestartCPU) {
+        /* PMC_CNTRL.MAIN_RST resets the SoC directly, independently of WDT0.
+         * Preserve the PMC's other control bits and retained scratch state. */
+        REG(pmc_base, 0) |= 1U << 4;
+        io_sync();
+    } else if (type == kPEHaltCPU) {
+        /* An intentional halt must not be undone by an inherited watchdog. */
+        REG(timer_base, 0x10c) = 0xc45a;
+        io_sync();
+        REG(timer_base, 0x108) = 2;
+        io_sync();
+        REG(timer_base, 0x60) = 0;
+        io_sync();
+    }
+    for (;;) __asm__ volatile("wfi");
+}
 void tegra30_early_putc(char c)
 {
     vm_offset_t base;
@@ -110,6 +145,8 @@ static void tegra_interrupt_init(void)
     gicc_base = ml_io_map(gicc_phys & ~0xfffU, 0x1000) + 0x100;
     lic_base = ml_io_map(lic_phys, 0x1000);
     timer_base = ml_io_map(timer_phys, 0x1000);
+    pmc_base = ml_io_map(pmc_phys & ~0xfffU, 0x1000) + (pmc_phys & 0xfffU);
+    PE_halt_restart = tegra_halt_restart;
     REG(gicd_base, 0) = 0;
     REG(gicc_base, 0) = 0;
     banks = (REG(gicd_base, 4) & 31) + 1;

@@ -92,6 +92,10 @@ const char * gIOKernelConfigTables =
 "  	   'IOProviderClass'   = AppleARMIODevice;"
 "  	   'IONameMatch'       = 'programmer-switch';"
 "  	}"
+#if defined(TEGRA30_WATCHDOG)
+",{ 'IOClass' = Tegra30Watchdog; 'IOProviderClass' = AppleARMIODevice;"
+"   'IONameMatch' = 'nvidia,tegra30-watchdog'; }"
+#endif
 #if defined(TEGRA30_EMMC)
 ",{ 'IOClass' = Tegra30EMMC; 'IOProviderClass' = AppleARMIODevice;"
 "   'IONameMatch' = 'nvidia,tegra30-sdmmc4-emmc'; }"

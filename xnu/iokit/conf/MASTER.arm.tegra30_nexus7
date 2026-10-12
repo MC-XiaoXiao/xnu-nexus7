@@ -21,4 +21,5 @@ options		NO_KEXTD				# <no_kextd>
 options CONFIG_EMBEDDED
 
 options TEGRA30_EMMC
+options TEGRA30_WATCHDOG
 options TEGRA30_CPU
