@@ -89,6 +89,7 @@ typedef struct cpu_data {
     int cpu_interrupt_level;
     int cpu_phys_number;        /* Physical CPU */
     cpu_id_t cpu_id;            /* Platform Expert */
+    vm_offset_t cpu_reset_handler; /* Platform physical secondary entry */
     int cpu_signals;            /* IPI events */
     int cpu_prior_signals;      /* Last set of events, and debugging. */
     int cpu_mcount_off;         /* mcount recursion */
@@ -103,7 +104,16 @@ typedef struct cpu_data {
     caddr_t cpu_onfault;        /* for alignment faults */
     int cpu_pending_ast;
     uint64_t interrupt_entry_time;
-    uint32_t interrupt_count[8];
+    /* PROCESSOR_CPU_STAT counters, in the public ARM ABI order. */
+    uint32_t irq_ex_cnt;
+    uint32_t ipi_cnt;
+    uint32_t timer_cnt;
+    uint32_t undef_ex_cnt;
+    uint32_t unaligned_cnt;
+    uint32_t vfp_cnt;
+    uint32_t vfp_shortv_cnt;
+    uint32_t data_ex_cnt;
+    uint32_t instr_ex_cnt;
     uint64_t rtcPop;
     struct pmap *user_pmap;
     uint64_t absolute_time;
@@ -131,6 +141,7 @@ typedef struct cpu_data {
     IOInterruptHandler handler;     /* for IOKit */
     void* nub;
     void* target;
+    uint64_t cpu_idle_latency;
     void* refCon;
 } cpu_data_t;
 

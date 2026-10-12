@@ -81,15 +81,15 @@ uint64_t tscFreq = 0, tscFCvtt2n, tscFCvtn2t;
 
 uint64_t rtclock_timer_scale_convert(void)
 {
-    uint64_t ticks;
-    uint64_t nsecs = pe_arm_get_timebase(NULL);
+    uint64_t ticks = pe_arm_get_timebase(NULL);
 
-    /* nanoseconds = (((rdtsc - rnt_tsc_base) * 10e9) / tscFreq) - rnt_ns_base; */
     if(!tscFreq)
         return 0;
 
-    ticks = (nsecs * NSEC_PER_SEC / tscFreq);
-    return ticks;
+    /* Split before multiplying: the ARM32 platform frequency is a 32-bit
+     * value, so the fractional numerator fits even after long uptimes. */
+    return (ticks / tscFreq) * NSEC_PER_SEC +
+           ((ticks % tscFreq) * NSEC_PER_SEC) / tscFreq;
 }
 
 static uint64_t deadline_to_decrementer(uint64_t deadline, uint64_t now)
@@ -109,7 +109,13 @@ static uint64_t deadline_to_decrementer(uint64_t deadline, uint64_t now)
  */
 uint64_t tmrCvt(uint64_t time, uint64_t unit)
 {
-    return ((time * unit) >> 32);
+    /* Return the middle 64 bits of the 128-bit product, as in Apple's
+     * tmrCvt implementation. Discard only the fractional and overflow words. */
+    uint64_t low = (uint64_t)(uint32_t)time * (uint32_t)unit;
+    return (low >> 32) +
+           (time >> 32) * (uint32_t)unit +
+           (uint32_t)time * (unit >> 32) +
+           (((time >> 32) * (unit >> 32)) << 32);
 }
 
 static uint64_t rtclock_internal_arm_timer(uint64_t deadline, uint64_t now)
@@ -257,12 +263,9 @@ nanoseconds_to_absolutetime(uint64_t nanoseconds, uint64_t* result)
 
 void clock_get_system_nanotime(clock_sec_t * secs, clock_nsec_t * nanosecs)
 {
-#if defined(BOARD_CONFIG_QSD8250_LEO) || defined(BOARD_CONFIG_TEGRA30_NEXUS7)
-    /* Hardware ticks must be converted to the kernel nanosecond timebase. */
+    /* mach_absolute_time is the common ARM nanosecond timebase.  Reading the
+     * raw counter here would make userspace clock_gettime board-dependent. */
     uint64_t now = mach_absolute_time();
-#else
-    uint64_t now = pe_arm_get_timebase(NULL);
-#endif
 
     _absolutetime_to_nanotime(now, secs, nanosecs);
 }

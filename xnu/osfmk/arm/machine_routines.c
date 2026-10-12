@@ -70,6 +70,7 @@
 #include <arm/cpu_affinity.h>
 #include <mach/processor.h>
 #include <kern/processor.h>
+#include <kern/clock.h>
 #include <kern/machine.h>
 #include <kern/cpu_data.h>
 #include <kern/cpu_number.h>
@@ -143,7 +144,8 @@ vm_offset_t ml_stack_remaining(void)
  */
 void ml_init_interrupt(void)
 {
-    (void) ml_set_interrupts_enabled(TRUE);
+    /* iOS 6 ARM leaves this hook empty. slave_machine_init still has to
+     * initialize clocks at splsched; normal dispatch restores IRQs later. */
 }
 
 /**
@@ -324,9 +326,8 @@ kern_return_t ml_processor_register(cpu_id_t cpu_id,
                                     processor_t * processor_out,
                                     ipi_handler_t * ipi_handler)
 {
-#if defined(BOARD_CONFIG_QSD8250_LEO) || defined(BOARD_CONFIG_TEGRA30_NEXUS7)
-    /* Bind the actual already bootstrapped single Scorpion master to IOKit.
-     * No secondary CPU, allocation, synthetic processor or IPI implementation. */
+    /* Bind the already bootstrapped single ARM master to IOKit.  This is the
+     * UP registration path; no board identity is needed to publish it. */
     cpu_data_t *data = current_cpu_datap();
     if (!cpu_id || !processor_out || !ipi_handler || !data ||
         cpu_number() != master_cpu || master_cpu != 0 ||
@@ -338,7 +339,6 @@ kern_return_t ml_processor_register(cpu_id_t cpu_id,
     data->cpu_id = cpu_id;
     *processor_out = master_processor;
     *ipi_handler = NULL; /* UP has no supported target-IPI transport. */
-#endif
     return KERN_SUCCESS;
 }
 
@@ -493,9 +493,16 @@ void ml_cpu_get_info(ml_cpu_info_t * ml_cpu_info)
     return;
 }
 
+void ml_init_delay_spin_threshold(uint32_t latency_ns)
+{
+    nanoseconds_to_absolutetime((uint64_t)latency_ns,
+                              &current_cpu_datap()->cpu_idle_latency);
+}
+
 boolean_t ml_delay_should_spin(uint64_t interval)
 {
-    return FALSE;
+    uint64_t latency = current_cpu_datap()->cpu_idle_latency;
+    return latency != 0 && interval < latency;
 }
 
 /*
@@ -545,3 +552,19 @@ ml_phys_read_write_comb_gen(unsigned int, unsigned int, addr64_t, _word_64)
 
 ml_phys_read_write_comb_gen(unsigned long long, unsigned long long, vm_offset_t, _double) 
 ml_phys_read_write_comb_gen(unsigned long long, unsigned long long, addr64_t, _double_64)
+
+void slave_machine_init(void *machine_param)
+{
+    (void)machine_param;
+    cpu_machine_init();
+    clock_init();
+}
+
+void handle_pending_TLB_flushes(void)
+{
+}
+
+boolean_t machine_timeout_suspended(void)
+{
+    return FALSE;
+}

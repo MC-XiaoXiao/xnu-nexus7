@@ -34,6 +34,8 @@
 #include <mach/mach_types.h>
 #include <kern/debug.h>
 #include <kern/processor.h>
+#include <arm/cpu_data.h>
+#include <pexpert/pexpert.h>
 
 unsigned int real_ncpus = 1;
 
@@ -44,7 +46,16 @@ void init_ast_check(processor_t processor)
 
 void cause_ast_check(processor_t processor)
 {
+    cpu_data_t *source = current_cpu_datap();
+    cpu_data_t *target = cpu_datap(processor->cpu_id);
+    if (source && target && source->cpu_id && target->cpu_id)
+        PE_cpu_signal(source->cpu_id, target->cpu_id);
+}
 
+/* Idle wakeup uses the same platform IPI as a remote AST check. */
+void machine_signal_idle(processor_t processor)
+{
+    cause_ast_check(processor);
 }
 
 /*

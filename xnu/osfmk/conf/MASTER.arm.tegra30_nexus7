@@ -66,3 +66,5 @@ options     CONFIG_NESTED_PMAP              # <!no_nested_pmap>
 # Nexus7: consistent embedded policy across components.
 options CONFIG_EMBEDDED
 options CONFIG_MEMORYSTATUS
+
+options TEGRA30_SMP

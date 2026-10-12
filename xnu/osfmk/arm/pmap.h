@@ -47,7 +47,12 @@
 #include <kern/queue.h>
 #include <vm/vm_page.h>
 
+#include <arm/arch.h>
+#if defined(_ARM_ARCH_7)
+#define mmu_texcb_small(x) (((((x) & 0x1c) << 4) | (((x) & 3) << 2)) | 0x400)
+#else
 #define mmu_texcb_small(x) ((((x) & 0x1c) << 4) | (((x) & 3) << 2))
+#endif
 
 #define MMU_TEXCB_ORDERED 0
 #define MMU_TEXCB_SH_DEVICE 1
@@ -112,6 +117,10 @@ struct pmap {
 #define PMAP_ASID_MAX_CPUS  (48)  /* Must be a multiple of 8 */
     asid_t pmap_asid_cpus[PMAP_ASID_MAX_CPUS];
     volatile uint8_t pmap_asid_coherency_vector[PMAP_ASID_MAX_CPUS];
+    struct pmap *nested_pmap;
+    addr64_t nested_region_addr;
+    addr64_t nested_region_source;
+    uint64_t nested_region_size;
 };
 
 typedef struct arm_l1_entry_t {
@@ -278,6 +287,7 @@ extern void pmap_init_sharedpage(vm_offset_t cpg);
 extern void pmap_disable_NX(pmap_t pmap);
 
 extern boolean_t pmap_valid_page(ppnum_t pn);
+extern boolean_t pmap_claim_bootstrap_page(ppnum_t pn);
 extern void pmap_deallocate_l1(pmap_t pmap);
 extern vm_offset_t pmap_pte(pmap_t pmap, vm_offset_t virt);
 extern void pt_fake_zone_init(int);

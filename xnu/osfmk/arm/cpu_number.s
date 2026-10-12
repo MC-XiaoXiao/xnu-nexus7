@@ -31,10 +31,4 @@
 	.align 2
 	.globl _cpu_number
 _cpu_number:
-#ifdef _ARM_ARCH_7
-	mrc	p15, 0, r0, c13, c0, 3
-	and	r0, r0, #3
-#else
-	mov	r0, #0
-#endif
-	bx	lr
+	b _get_cpu_number

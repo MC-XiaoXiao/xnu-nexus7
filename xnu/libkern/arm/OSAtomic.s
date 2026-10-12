@@ -47,6 +47,11 @@
 .align 4
 .globl _OSCompareAndSwap64
 _OSCompareAndSwap64:
+#ifdef _ARM_ARCH_7
+    dmb     ishst
+#else
+    mcr     p15, 0, r12, c7, c10, 5
+#endif
     ldr     r12, [sp]
     stmfd   sp!,{r4,r5,lr}
 _loop:
@@ -69,6 +74,11 @@ _loop:
 #endif
     cmp     r4, #0
     bne     _loop
+#ifdef _ARM_ARCH_7
+    dmb     ish
+#else
+    mcr     p15, 0, r12, c7, c10, 5
+#endif
     mov     r0, #1
 ret:
     ldmfd   sp!,{r4,r5,pc}

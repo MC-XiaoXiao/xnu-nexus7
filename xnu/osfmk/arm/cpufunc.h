@@ -47,6 +47,7 @@ typedef int bool, vsize_t;
 extern void	arm_cpu_sleep(int);
 extern void	arm_setttb(u_int, bool);
 extern void	arm_context_switch(u_int);
+extern void	set_mmu_ttbcr(u_int);
 extern void	arm_set_context_id(u_int);
 extern void	arm_tlb_flushID_SE(u_int);
 extern void arm_tlb_flushID_ASID(u_int);
@@ -56,6 +57,7 @@ extern void	arm_drain_writebuf(void);
 
 extern void arm_icache_sync_range(vaddr_t, vsize_t);
 extern void arm_icache_sync_all(void);
+extern void arm_icache_inv_all(void);
 extern void arm_dcache_wb_range(vaddr_t, vsize_t);
 extern void arm_dcache_wbinv_range(vaddr_t, vsize_t);
 extern void arm_dcache_inv_range(vaddr_t, vsize_t);

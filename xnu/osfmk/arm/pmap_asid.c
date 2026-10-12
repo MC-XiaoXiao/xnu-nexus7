@@ -149,9 +149,6 @@ void pmap_asid_configure(void)
 {
     int ccpu = cpu_number();
 
-    kprintf("[ASID configuration start]\n");
-    printf("PMAP: enabled ASID support\n");
-
     assert(ml_get_interrupts_enabled() == FALSE || get_preemption_level() != 0);
     if(!pmap_asid_disabled) {
         if (OSIncrementAtomic(&pmap_asid_ncpus) == machine_info.max_cpus) {

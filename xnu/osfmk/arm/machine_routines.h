@@ -79,7 +79,7 @@ void ml_install_interrupt_handler(void *nub, int source, void *target,
 
 void ml_get_timebase(unsigned long long *timestamp);
 void ml_init_lock_timeout(void);
-void ml_init_delay_spin_threshold(void);
+void ml_init_delay_spin_threshold(uint32_t latency_ns);
 
 extern void ml_get_power_state(boolean_t * icp, boolean_t * pidlep);
 

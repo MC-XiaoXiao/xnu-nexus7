@@ -634,6 +634,16 @@ extern void OSSpinLockUnlock(volatile OSSpinLock * lock);
  */
 static __inline__ void OSSynchronizeIO(void)
 {
+#if defined(__arm__) && !defined(__LP64__)
+    /* Device accesses must complete across the system, including devices
+     * outside the inner-shareable CPU domain. Also constrain the compiler. */
+#if defined(_ARM_ARCH_7) || (defined(__ARM_ARCH) && __ARM_ARCH >= 7)
+    __asm__ volatile("dsb sy" ::: "memory");
+#else
+    UInt32 zero = 0;
+    __asm__ volatile("mcr p15, 0, %0, c7, c10, 4" :: "r" (zero) : "memory");
+#endif
+#endif
 }
 #if	defined(XNU_KERNEL_PRIVATE)
 #if   defined(__i386__) || defined(__x86_64__)
@@ -649,7 +659,7 @@ static inline void OSMemoryBarrier(void) {
 	__asm__ volatile("dsb" ::: "memory");
 #else
 	UInt32 temp = 0;
-	__asm__ volatile("mcr p15, 0, %0, c7, c10, 4" : : "r" (temp));
+	__asm__ volatile("mcr p15, 0, %0, c7, c10, 4" : : "r" (temp) : "memory");
 #endif
 }
 #else

@@ -77,9 +77,6 @@ EnterARM(Switch_context)
     addeq   r3, r3, #16
     stmiaeq r3!, {r4-lr}
 
-    /* Save current thread */
-    LOAD_ADDR(r4, CurrentThread)
-    str     r2, [r4]
 
     /* Set old/new threads */
     mcr     p15, 0, r2, c13, c0, 4
@@ -104,9 +101,6 @@ EnterARM(Switch_context)
  * Load the registers and prepare for a context switch.
  */
 EnterARM(machine_load_context)
-    /* Save current thread */
-    LOAD_ADDR(r4, CurrentThread)
-    str     r0, [r4]
 
     /* Zero out frame pointer */
     mov     r7, #0
@@ -116,7 +110,7 @@ EnterARM(machine_load_context)
 
     /* Set cthread value */
     ldr     r1, [r0, MACHINE_THREAD_CTHREAD_SELF]
-    mrc     p15, 0, r2, c13, c0, 3
+    mcr     p15, 0, r1, c13, c0, 3
 
     /* Load registers and go. */
     ldr     r3, [r0, TH_PCB_ISS]
@@ -165,11 +159,19 @@ thread_return_join:
     b       _thread_exception_return
 
 return_to_user:
-    /* Restore registers */
+    /* A user return must not escape a preemption-disabled kernel region. */
     LoadThreadRegister(r12)
-    ldr     sp, [r12, TH_PCB_USS]
-    ldr     r0, [sp, #0x40]
+    ldr     r1, [r12, MACHINE_THREAD_PREEMPT_COUNT]
+    cmp     r1, #0
+    bne     user_return_preempt_panic
 
+    /* Validate the saved mode before changing the kernel stack or SPSR. */
+    ldr     r2, [r12, TH_PCB_USS]
+    ldr     r0, [r2, #0x40]
+    and     r1, r0, #0x1f
+    cmp     r1, #0x10
+    bne     user_return_mode_panic
+    mov     sp, r2
     msr     spsr_cxsf, r0
 #ifdef _ARM_ARCH_7
     clrex
@@ -178,5 +180,22 @@ return_to_user:
 
     ldmfd   sp, {r0-lr}^
     movs    pc, lr
+
+user_return_preempt_panic:
+    adr     r0, user_return_preempt_string
+    b       user_return_panic
+user_return_mode_panic:
+    adr     r0, user_return_mode_string
+user_return_panic:
+    stmfd   sp!, {r7, lr}
+    mov     r7, sp
+    blx     _panic
+    b       .
+
+user_return_preempt_string:
+    .asciz  "load_and_go_user: preemption_level %d\n"
+user_return_mode_string:
+    .asciz  "Exception Vector: Illegal Mode: 0x%08x\n"
+    .align  2
 
 LOAD_ADDR_GEN_DEF(CurrentThread)

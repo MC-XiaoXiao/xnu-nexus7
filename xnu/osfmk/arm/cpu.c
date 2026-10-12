@@ -69,7 +69,7 @@
 /*
  * CPU bootstrap, used to create core structures for the boot processor.
  *
- * SMP support coming soon.
+ * Secondary registration and startup are implemented in smp.c.
  */
 
 #include <kern/kalloc.h>
@@ -86,6 +86,10 @@
 #include <arm/misc_protos.h>
 #include <mach/machine.h>
 #include <arm/arch.h>
+#include <arm/mp.h>
+#include <arm/cpufunc.h>
+#include <kern/cpu_number.h>
+#include <pexpert/pexpert.h>
 #include "proc_reg.h"
 
 /*
@@ -96,6 +100,7 @@ extern uint32_t intstack[];     /* bottom */
 
 struct processor BootProcessor;
 cpu_data_t cpu_data_master;
+cpu_data_t *cpu_data_ptr[MAX_CPUS] = { &cpu_data_master };
 
 enum cpu_class {
     CPU_CLASS_NONE,
@@ -882,15 +887,20 @@ void cpu_init(void)
 /**
  * get_cpu_number
  * 
- * Return the current processor number from the PCB. (Right now since we have
- * no SMP support, we have only 1 processor.
- *
- * When SMP becomes of real importance, we can get the current MPCore number
- * by reading some registers in the CP15 coprocessor.
+ * Return the logical CPU using the platform MPIDR mapping.
  */
 int get_cpu_number(void)
 {
+#if defined(_ARM_ARCH_7)
+    unsigned int mpidr;
+    __asm__ volatile("mrc p15, 0, %0, c0, c0, 5" : "=r"(mpidr));
+    extern int arm_cpu_logical[MAX_CPUS];
+    unsigned int physical = mpidr & 0xff;
+    int logical = physical < MAX_CPUS ? arm_cpu_logical[physical] : -1;
+    return logical >= 0 ? logical : master_cpu;
+#else
     return 0;
+#endif
 }
 
 /**
@@ -1066,7 +1076,8 @@ kern_return_t cpu_start(int cpu)
         return KERN_SUCCESS;
     }
 
-    return KERN_SUCCESS;
+    extern kern_return_t arm_cpu_start(int);
+    return arm_cpu_start(cpu);
 }
 
 kern_return_t cpu_info_count(processor_flavor_t flavor, unsigned int *count)

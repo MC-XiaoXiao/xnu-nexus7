@@ -139,6 +139,19 @@ void doexception(int exc, mach_exception_code_t code,
     exception_triage(exc, codes, 2);
 }
 
+/* Failed cache traps use the same user exception framework as data aborts.
+ * Keep the PC on the trapping instruction so an exception handler can retry. */
+void arm_cache_exception(uint32_t address)
+{
+    thread_t thread = current_thread();
+    arm_saved_state_t *state = thread->machine.uss;
+
+    state->pc -= (state->cpsr & (1U << 5)) ? 2 : 4;
+    thread->machine.es.far = address;
+    doexception(EXC_BAD_ACCESS, KERN_INVALID_ADDRESS, address);
+}
+
+
 /**
  * ifsr_to_human
  *

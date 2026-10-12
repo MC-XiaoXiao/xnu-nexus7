@@ -24,6 +24,10 @@
 #define ldrex           ldr
 #endif
 
+#if defined(_ARM_ARCH_7) && !defined(NO_EXCLUSIVES)
+#define ARM_LOCK_EXCLUSIVES 1
+#endif
+
 #ifndef _ARM_ARCH_7
 #undef EnterThumb
 #define EnterThumb EnterARM
@@ -67,12 +71,35 @@ EnterARM(lck_spin_lock)
 EnterARM(hw_lock_lock)
     LoadLockHardwareRegister(r12)
     IncrementPreemptLevel(r12, r2)
+#ifdef ARM_LOCK_EXCLUSIVES
+hw_lock_acquire_retry:
+    ldrex   r3, [r0]
+    tst     r3, #1
+    bne     hw_lock_lock_wait
+    orr     r1, r3, #1
+    strex   r2, r1, [r0]
+    cmp     r2, #0
+    bne     hw_lock_acquire_retry
+    dmb     ish
+    bx      lr
+
+hw_lock_lock_wait:
+    stmfd   sp!, {r0,r1,r7,lr}
+    add     r7, sp, #8
+    mov     r12, #1
+    bl      hw_lock_wait_default
+    cmp     r0, #0
+    ldmfd   sp!, {r0,r1,r7,lr}
+    bxne    lr
+    b       hw_lock_lock_panic
+#else
     ldr     r3, [r0]
     mov     r2, #1
     orr     r1, r3, #1
     ands    r2, r2, r3
     streq   r1, [r0]
     bxeq    lr
+#endif
 hw_lock_lock_panic:
     mov     r1, r0
     ldr     r2, [r1]
@@ -88,9 +115,21 @@ _panicString:
  */
 EnterARM(lck_spin_unlock)
 EnterARM(hw_lock_unlock)
+#ifdef ARM_LOCK_EXCLUSIVES
+    dmb     ishst
+hw_lock_release_retry:
+    ldrex   r3, [r0]
+    bic     r3, r3, #1
+    strex   r1, r3, [r0]
+    cmp     r1, #0
+    bne     hw_lock_release_retry
+    dsb     ishst
+    sev
+#else
     ldr     r3, [r0]
     bic     r3, r3, #1
     str     r3, [r0]
+#endif
     b       __enable_preemption
 
 /**
@@ -101,12 +140,24 @@ EnterARM(lck_spin_try_lock)
 EnterARM(hw_lock_try)
     mrs     r1, cpsr
     cpsid   if
+#ifdef ARM_LOCK_EXCLUSIVES
+hw_lock_try_retry:
+    ldrex   r3, [r0]
+    tst     r3, #1
+    bne     hw_lock_try_fail
+    orr     r2, r3, #1
+    strex   r12, r2, [r0]
+    cmp     r12, #0
+    bne     hw_lock_try_retry
+    dmb     ish
+#else
     ldr     r3, [r0]
     mov     r2, #1
     orr     r12, r3, #1
     ands    r2, r2, r3
     streq   r12, [r0]
     bne     hw_lock_try_fail
+#endif
     LoadLockHardwareRegister(r12)
     IncrementPreemptLevel(r12, r2)
     mov     r0, #1
@@ -123,6 +174,75 @@ hw_lock_try_return:
 EnterARM(hw_lock_to)
     LoadLockHardwareRegister(r12)
     IncrementPreemptLevel(r12, r2)
+#ifdef ARM_LOCK_EXCLUSIVES
+hw_lock_to_retry:
+    ldrex   r3, [r0]
+    tst     r3, #1
+    bne     hw_lock_to_wait
+    orr     r3, r3, #1
+    strex   r2, r3, [r0]
+    cmp     r2, #0
+    bne     hw_lock_to_retry
+    dmb     ish
+    mov     r0, #1
+    bx      lr
+
+hw_lock_to_wait:
+    mov     r12, #1
+    mov     r2, #0
+hw_lock_mask_to_wait:
+    /* Retain the caller's absolute-time timeout across clock calls. The
+     * preemption hold was acquired once, before entering this slow path. */
+    stmfd   sp!, {r4,r5,r6,r7,lr}
+    add     r7, sp, #12
+    stmfd   sp!, {r8,r10,r11}
+    mov     r4, r0
+    mov     r5, r1
+    mov     r10, r12
+    mov     r11, r2
+    blx     _mach_absolute_time
+    mov     r6, r0
+    mov     r8, r1
+hw_lock_to_wait_retry:
+    ldrex   r3, [r4]
+    tst     r3, r10
+    bne     hw_lock_to_wait_clock
+    orr     r3, r3, r10
+    strex   r2, r3, [r4]
+    cmp     r2, #0
+    bne     hw_lock_to_wait_retry
+    dmb     ish
+    mov     r0, #1
+    b       hw_lock_to_wait_return
+hw_lock_to_wait_clock:
+    /* Poll actively so an IRQ-masked caller can still reach its deadline. */
+    blx     _mach_absolute_time
+    subs    r0, r0, r6
+    sbcs    r1, r1, r8
+    bne     hw_lock_to_wait_expired
+    cmp     r0, r5
+    blo     hw_lock_to_wait_retry
+hw_lock_to_wait_expired:
+    cmp     r11, #0
+    bne     hw_lock_to_wait_failed
+    bl      __enable_preemption
+hw_lock_to_wait_failed:
+    mov     r0, #0
+hw_lock_to_wait_return:
+    ldmfd   sp!, {r8,r10,r11}
+    ldmfd   sp!, {r4,r5,r6,r7,pc}
+
+hw_lock_wait_default:
+    LOAD_ADDR(r1, LockTimeOut)
+    ldr     r1, [r1]
+    cmp     r1, #0
+    bne     hw_lock_wait_default_ready
+    /* Use ml_init_lock_timeout's default until early bootstrap sets it. */
+    LoadConstantToReg(250000000, r1)
+hw_lock_wait_default_ready:
+    mov     r2, #1
+    b       hw_lock_mask_to_wait
+#else
     ldr     r3, [r0]
     mov     r2, #1
     orr     r1, r3, #1
@@ -131,6 +251,7 @@ EnterARM(hw_lock_to)
     eors    r0, r2, #1
     beq     hw_lock_to_enable_preempt
     bx      lr
+#endif
 hw_lock_to_enable_preempt:
     stmfd   sp!, {r0,r1,r7,lr}
     add     r7, sp, #8
@@ -158,8 +279,14 @@ rwlsloopres:
 #ifndef BOARD_CONFIG_OMAP3530
     strex   r2, r1, [r0]
     movs    r2, r2
+#ifdef ARM_LOCK_EXCLUSIVES
+    bne     rwlsloop
+    dmb     ish
+    bx      lr
+#else
     bxeq    lr
     b       rwlsloop
+#endif
     str     r1, [r0]
     bx      lr
 #endif
@@ -200,8 +327,14 @@ rwleloop:
 #ifndef NO_EXCLUSIVES
     strex       r2, r1, [r0]
     movs        r2, r2
+#ifdef ARM_LOCK_EXCLUSIVES
+    bne         rwleloop
+    dmb         ish
+    bx          lr
+#else
     bxeq        lr
     b           rwleloop
+#endif
 #else
     str         r1, [r0]
     msr         cpsr_cf, r12
@@ -216,6 +349,9 @@ rwleslow:
  */
 EnterARM(lock_done)
 EnterARM(lck_rw_done)
+#ifdef ARM_LOCK_EXCLUSIVES
+    dmb         ishst
+#endif
 #ifdef BOARD_CONFIG_OMAP3530
     mrs         r9, cpsr
     cpsid       if
@@ -223,7 +359,11 @@ EnterARM(lck_rw_done)
 _lock_done_enter:
     ldrex       r1, [r0]
     ands        r2, r1, #1
+#ifdef ARM_LOCK_EXCLUSIVES
+    bne         rwldinterlock_wait
+#else
     bne         rwldpanic
+#endif
     LoadConstantToReg(0xFFFF0000, r3)
     ands        r2, r1, r3
     beq         rwldexcl
@@ -260,11 +400,19 @@ rwldstore:
     moveq       r0, r3
     bxeq        lr
     stmfd       sp!,{r0,r3,r7,lr}
+    add         r7, sp, #8
     add         r0, r0, #8
     blx         _thread_wakeup
     ldmfd       sp!,{r0,r3,r7,lr}
     mov         r0, r3
     bx          lr
+#ifdef ARM_LOCK_EXCLUSIVES
+rwldinterlock_wait:
+    ldr         r1, [r0]
+    tst         r1, #1
+    bne         rwldinterlock_wait
+    b           _lock_done_enter
+#endif
 rwldpanic:
     mov         r2, r1
     mov         r1, r0
@@ -283,7 +431,7 @@ EnterARM(lck_rw_lock_shared_to_exclusive)
     ands        r2, r1, r3
     beq         rwlsepanic
     bic         r1, r1, r3
-    LOAD_ADDR(r12, lck_rw_lock_shared_gen)
+    LOAD_ADDR(r12, lck_rw_lock_shared_to_exclusive_gen)
     subs        r2, r2, #0x10000
     bxne        r12
     ands        r3, r1, #5
@@ -295,6 +443,9 @@ EnterARM(lck_rw_lock_shared_to_exclusive)
     bne         _lock_read_to_write
 #else
     str         r1, [r0]
+#endif
+#ifdef ARM_LOCK_EXCLUSIVES
+    dmb         ish
 #endif
     mov         r0, #1
     bx          lr
@@ -311,14 +462,22 @@ lckReadToWritePanicString:
  */
 EnterARM(lck_rw_lock_exclusive_to_shared)
 EnterARM(lock_write_to_read)
+#ifdef ARM_LOCK_EXCLUSIVES
+    dmb         ish
+#endif
 #ifdef NO_EXCLUSIVES
     mrs         r12, cpsr
     orr         r2, r12, #0xc0
     msr         cpsr_cf, r2
 #endif
+.Lrw_downgrade_retry:
     ldrex       r1, [r0]
     ands        r2, r1, #1
+#ifdef ARM_LOCK_EXCLUSIVES
+    bne         rwlstinterlock_wait
+#else
     bne         rwlstexit
+#endif
     and         r2, r1, #2
     ands        r3, r1, #4
     mov         r3, #6
@@ -338,6 +497,13 @@ EnterARM(lock_write_to_read)
     add         r0, r0, #8
     LOAD_ADDR(r12, thread_wakeup)
     bx          r12
+#ifdef ARM_LOCK_EXCLUSIVES
+rwlstinterlock_wait:
+    ldr         r1, [r0]
+    tst         r1, #1
+    bne         rwlstinterlock_wait
+    b           .Lrw_downgrade_retry
+#endif
 rwlstexit:
     mov         r2, r1
     mov         r1, r0
@@ -351,6 +517,9 @@ rwlstePanicString:
  * lck_mtx_unlock
  */
 EnterARM(lck_mtx_unlock)
+#ifdef ARM_LOCK_EXCLUSIVES
+    dmb     ishst
+#endif
 #ifdef NO_EXCLUSIVES
     mrs     r9, cpsr
     orr     r2, r9, #0xc0
@@ -382,6 +551,11 @@ lmuslow:
 #endif
     stmfd       sp!,{r0,r1,r7,lr}
     add         r7, sp, #8
+#ifdef ARM_LOCK_EXCLUSIVES
+    bl          _hw_lock_lock
+    ldr         r1, [r0]
+    mov         r3, r1
+#else
     LoadLockHardwareRegister(r12)
     IncrementPreemptLevel(r12, r2)
     ldr         r1, [r0]
@@ -389,15 +563,20 @@ lmuslow:
     bne         lmupanic
     orr         r3, r1, #1
     str         r3, [r0]
+#endif
     bics        r1, r1, #3
     ands        r2, r3, #2
-    beq         lmupanic
+    beq         lmu_release_interlock
     blx         _lck_mtx_unlock_wakeup
+lmu_release_interlock:
     ldmfd       sp!,{r0,r1,r7,lr}
     ldr         r1, [r0]
     and         r3, r1, #2
     str         r3, [r0]
 lmuret:
+#ifdef ARM_LOCK_EXCLUSIVES
+    dmb         ish
+#endif
     b           __enable_preemption
 lmupanic:
     mov         r1, r0
@@ -429,6 +608,9 @@ mlckretry:
     str     r12, [r0]
     msr     cpsr_cf, r2
 #endif 
+#ifdef ARM_LOCK_EXCLUSIVES
+    dmb     ish
+#endif
     bx      lr
 mlckslow:
 #ifdef NO_EXCLUSIVES
@@ -436,15 +618,23 @@ mlckslow:
 #endif
     stmfd   sp!,{r0,r1,r7,lr}
     add     r7, sp, #8
+#ifdef ARM_LOCK_EXCLUSIVES
+    bl      _hw_lock_lock
+    ldr     r3, [r0]
+    bics    r1, r3, #3
+#else
     LoadLockHardwareRegister(r12)
     IncrementPreemptLevel(r12, r2)
     ldr     r3, [r0]
     ands    r2, r3, #1
     bne     mlckpanic
     bics    r1, r3, #2
+#endif
     bne     mlckwait
+#ifndef ARM_LOCK_EXCLUSIVES
     orr     r3, r3, #1
     str     r3, [r0]
+#endif
     blx     _lck_mtx_lock_acquire
     ands    r0, r0, r0
     ldmfd   sp!,{r0,r1,r7,lr}
@@ -452,14 +642,13 @@ mlckslow:
     mov     r3, r12
     orrne   r3, r3, #2
     str     r3, [r0]
+#ifdef ARM_LOCK_EXCLUSIVES
+    dmb     ish
+#endif
     b       __enable_preemption
 mlckwait:
-#if BOARD_CONFIG_ARMPBA8 || BOARD_CONFIG_QSD8250_LEO
     /* lock_wait requires the interlock; unlock needs bit 1 to wake waiters. */
     orr     r3, r3, #3
-#else
-    orr     r3, r3, #0
-#endif
     str     r3, [r0]
     blx     _lck_mtx_lock_wait
     ldmfd   sp!,{r0,r1,r7,lr}
@@ -495,6 +684,9 @@ lmtstart:
     str         r12, [r0]
     msr         cpsr_cf, r2
 #endif
+#ifdef ARM_LOCK_EXCLUSIVES
+    dmb         ish
+#endif
     mov         r0, #1
     bx          lr
 lmtslow:
@@ -504,14 +696,24 @@ lmtslow:
     mov         r1, #0
     stmfd       sp!, {r0,r1,r7,lr}
     add         r7, sp, #8
+#ifdef ARM_LOCK_EXCLUSIVES
+    bl          _hw_lock_lock
+    ldr         r3, [r0]
+    bics        r2, r3, #3
+    bic         r1, r3, #1
+    strne       r1, [r0]
+#else
     IncrementPreemptLevel(r12, r2)
     ldr         r3, [r0]
     ands        r2, r3, #1
     bne         lmtpanic
     bics        r2, r3, #2
+#endif
     bne         lmtret
+#ifndef ARM_LOCK_EXCLUSIVES
     orr         r3, r3, #1
     str         r3, [r0]
+#endif
     blx         _lck_mtx_lock_acquire
     ands        r0, r0, r0
     ldmfd       sp!,{r0,r1,r7,lr}
@@ -519,6 +721,9 @@ lmtslow:
     mov         r3, r12
     orrne       r3, r3, #2
     str         r3, [r0]
+#ifdef ARM_LOCK_EXCLUSIVES
+    dmb         ish
+#endif
     mov         r1, #1
     stmfd       sp!,{r0,r1,r7,lr}
     add         r7, sp, #8
@@ -581,9 +786,14 @@ EnterARM(lck_rw_try_lock_shared)
     orr     r1, r9, #0xc0
     msr     cpsr_cf, r1
 #endif
+.Lrw_try_shared_retry:
     ldrex   r1, [r0]
     ands    r2, r1, #1
+#ifdef ARM_LOCK_EXCLUSIVES
+    bne     rwtlsinterlock_wait
+#else
     bne     rwtlspanic
+#endif
     ands    r2, r1, #0xC
     bne     rwtlsopt
 rwtlsloopres:
@@ -596,6 +806,9 @@ rwtlsloopres:
     str     r1, [r0]
     msr     cpsr_cf, r9
 #endif
+#ifdef ARM_LOCK_EXCLUSIVES
+    dmb     ish
+#endif
     mov     r0, #1
     bx      lr
 rwtlsopt:
@@ -607,6 +820,13 @@ rwtlsopt:
 rwtlsfail:
     mov     r0, #0
     bx      lr
+#ifdef ARM_LOCK_EXCLUSIVES
+rwtlsinterlock_wait:
+    ldr     r1, [r0]
+    tst     r1, #1
+    bne     rwtlsinterlock_wait
+    b       .Lrw_try_shared_retry
+#endif
 rwtlspanic:
     mov     r2, r1
     mov     r1, r0
@@ -624,10 +844,15 @@ EnterARM(lck_rw_try_lock_exclusive)
     orr     r1, r9, #0xc0
     msr     cpsr_cf, r1
 #endif
+.Lrw_try_exclusive_retry:
     ldrex   r1, [r0]
     ands    r2, r1, #1
+#ifdef ARM_LOCK_EXCLUSIVES
+    bne     rwtleinterlock_wait
+#else
     bne     rwtlepanic
-    LoadConstantToReg(0xFFFF0009, r3)
+#endif
+    LoadConstantToReg(0xFFFF000D, r3)
     ands    r2, r1, r3
     bne     rwtlefail
     orr     r1, r1, #8
@@ -639,11 +864,21 @@ EnterARM(lck_rw_try_lock_exclusive)
     str     r1, [r0]
     msr     cpsr_cf, r9
 #endif
+#ifdef ARM_LOCK_EXCLUSIVES
+    dmb     ish
+#endif
     mov     r0, #1
     bx      lr
 rwtlefail:
     mov     r0, #0
     bx      lr
+#ifdef ARM_LOCK_EXCLUSIVES
+rwtleinterlock_wait:
+    ldr     r1, [r0]
+    tst     r1, #1
+    bne     rwtleinterlock_wait
+    b       .Lrw_try_exclusive_retry
+#endif
 rwtlepanic:
     mov     r2, r1
     mov     r1, r0
@@ -660,13 +895,35 @@ EnterARM(hw_lock_bit)
     mov     r12, r12, lsl r1
     LoadLockHardwareRegister(r9)
     IncrementPreemptLevel(r9, r2)
+#ifdef ARM_LOCK_EXCLUSIVES
+hw_lock_bit_retry:
+    ldrex   r3, [r0]
+    tst     r3, r12
+    bne     hw_lock_bit_wait
+    orr     r1, r3, r12
+    strex   r2, r1, [r0]
+    cmp     r2, #0
+    bne     hw_lock_bit_retry
+    dmb     ish
+    bx      lr
+
+hw_lock_bit_wait:
+    stmfd   sp!, {r0,r1,r7,lr}
+    add     r7, sp, #8
+    bl      hw_lock_wait_default
+    cmp     r0, #0
+    ldmfd   sp!, {r0,r1,r7,lr}
+    bxne    lr
+    b       hwlbitpanic
+#else
     ldrex    r3, [r0]
     orr     r1, r3, r12
     ands    r2, r12, r3
     streq   r1, [r0]
     bxeq    lr
+#endif
 hwlbitpanic:
-    mov     r0, r1
+    mov     r1, r0
     adr     r0, hwlbitPanicString
     blx     _panic
 hwlbitPanicString:
@@ -675,11 +932,25 @@ hwlbitPanicString:
 EnterARM(hw_unlock_bit)
     mov     r12, #1
     mov     r12, r12, lsl r1
+#ifdef ARM_LOCK_EXCLUSIVES
+    dmb     ishst
+hw_unlock_bit_retry:
+    ldrex   r3, [r0]
+    bic     r3, r3, r12
+    strex   r1, r3, [r0]
+    cmp     r1, #0
+    bne     hw_unlock_bit_retry
+    dsb     ishst
+    sev
+#else
     ldr     r3, [r0]
     bic     r3, r3, r12
     str     r3, [r0]
+#endif
     b       __enable_preemption
 
 LOAD_ADDR_GEN_DEF(thread_wakeup)
 LOAD_ADDR_GEN_DEF(lck_rw_lock_shared_gen)
 LOAD_ADDR_GEN_DEF(lck_rw_lock_exclusive_gen)
+LOAD_ADDR_GEN_DEF(lck_rw_lock_shared_to_exclusive_gen)
+LOAD_ADDR_GEN_DEF(LockTimeOut)

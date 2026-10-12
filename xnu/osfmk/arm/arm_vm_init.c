@@ -385,6 +385,9 @@ void arm_vm_init(uint32_t mem_limit, boot_args * args)
      * Map them... 
      */
     vm_offset_t *vecpt_start = (vm_offset_t *)(first_avail), *vectp, *va_vecpt;
+    /* RAM boots can reuse this allocation from the previous kernel. Do not
+     * inherit descriptors for neighbouring high addresses (e.g. commpage). */
+    bzero((void *)phys_to_virt((vm_offset_t)vecpt_start), L2_SIZE);
     vectp = (vm_offset_t *)addr_to_tte(phys_to_virt(cpu_ttb), VECTORS_BASE);
     *vectp = (((uint32_t) vecpt_start) | L1_TYPE_PTE);
     va_vecpt = (vm_offset_t *)(phys_to_virt(vecpt_start) + pte_offset(VECTORS_BASE));

@@ -48,9 +48,19 @@
  * lck_mtx_ilk_unlock
  */
 EnterARM(lck_mtx_ilk_unlock)
+#if defined(_ARM_ARCH_7) && !defined(NO_EXCLUSIVES)
+    dmb     ishst
+.Lmutex_ilk_unlock_retry:
+    ldrex   r2, [r0]
+    bic     r3, r2, #1
+    strex   r1, r3, [r0]
+    cmp     r1, #0
+    bne     .Lmutex_ilk_unlock_retry
+#else
     ldr     r2, [r0]
     bic     r3, r2, #1
     str     r3, [r0]
+#endif
     b       __enable_preemption
 
 /**
@@ -70,16 +80,17 @@ EnterARM(machine_idle)
     /* Disable all interrupts and go into wfi mode. */
 .Lmachine_idle_wfi:
     cpsid   if
+#ifdef _ARM_ARCH_7
+    dsb     sy
+#else
+    mcr     p15, 0, r0, c7, c10, 4
+#endif
     wfi
-    cpsie   if
 
 .Lmachine_idle_return:
-    bx      lr
-
-/**
- * machine_signal_idle
- */
-EnterThumb(machine_signal_idle)
+    /* The scheduler enters with IRQs masked. Both idle paths must permit
+     * interrupt dispatch before its next run-queue check. */
+    cpsie   if
     bx      lr
 
 /**
@@ -195,11 +206,12 @@ EnterARM(enable_preemption)
     /* Get thread ID */
     LoadThreadRegister(r12)
     ldr     r2, [r12, MACHINE_THREAD_PREEMPT_COUNT]
+    cmp     r2, #0
+    ble     preemption_count_panic
     subs    r2, r2, #1
     strne   r2, [r12, MACHINE_THREAD_PREEMPT_COUNT]
     bxne    lr
 
-#if defined(BOARD_CONFIG_QSD8250_LEO)
     /* Capture the caller's I/F state before masking either interrupt class. */
     mrs     r3, cpsr
     cpsid   if
@@ -207,16 +219,6 @@ EnterARM(enable_preemption)
     tst     r3, #0x80
     msrne   cpsr_c, r3
     bxne    lr
-#else
-    /* Preempt. */
-    cpsid   if
-
-    /* Check for interrupts */
-    mrs     r3, cpsr
-    tst     r3, #0x80
-    strne   r2, [r12, MACHINE_THREAD_PREEMPT_COUNT]
-    bxne    lr
-#endif
 
     /* Get CPU data and add an AST. */
     ldr     r1, [r12, MACHINE_THREAD_CPU_DATA]
@@ -229,40 +231,38 @@ EnterARM(enable_preemption)
     bx      lr
 
 __preempt:
-#if defined(BOARD_CONFIG_QSD8250_LEO)
     /* Keep the entry control state across the normal C AST return. Four
      * words preserve stack alignment and callee-saved r4/r7 as well as LR. */
     stmfd   sp!,{r3,r4,r7,lr}
     add     r7, sp, #8
+#if !defined(BOARD_CONFIG_QSD8250_LEO)
+    cpsie   f
+#endif
     mov     r0, #7
     mov     r1, #1
     blx     _ast_taken
     ldmfd   sp!,{r3,r4,r7,lr}
     msr     cpsr_c, r3
     bx      lr
-#else
-    /* Reenable interrupts */
-    cpsie   f
-    stmfd   sp!,{r7,lr}
-    add     r7, sp, #8
-    mov     r0, #7
-    mov     r1, #1
-    blx     _ast_taken
-    ldmfd   sp!,{r7,lr}
-    bx      lr
-#endif
+
+preemption_count_panic:
+    stmfd   sp!, {r7, lr}
+    mov     r7, sp
+    adr     r0, preemption_count_string
+    blx     _panic
+    b       .
+preemption_count_string:
+    .asciz  "locks_arm: preemption count is not positive\n"
+    .align  2
 
 /**
  * current_thread
  *
  * Return the core thread structure of the currently executing thread.
- * The reason this doesn't use the thread register is because the current
- * "executing" thread may not be the one in the register. Just get the one
- * saved from machine_set_current_thread.
+ * TPIDRPRW is private to each CPU, as in the Apple ARM context path.
  */
 EnterARM(current_thread)
-    LOAD_ADDR(r0, CurrentThread)
-    ldr     r0, [r0]
+    LoadThreadRegister(r0)
     bx      lr
 
 /**
@@ -276,7 +276,7 @@ EnterARM(current_thread)
 EnterARM(set_mmu_ttb)
 #ifdef _ARM_ARCH_7
     dsb     sy
-    orr     r0, r0, #0x48
+    orr     r0, r0, #0x4a @ Shareable WBWA translation table walks
 #else
     orr     r0, r0, #0x18
 #endif
@@ -288,7 +288,7 @@ EnterARM(set_mmu_ttb)
 EnterARM(set_mmu_ttb_alt)
 #ifdef _ARM_ARCH_7
     dsb     sy
-    orr     r0, r0, #0x48
+    orr     r0, r0, #0x4a @ Shareable WBWA translation table walks
 #else
     orr     r0, r0, #0x18
 #endif

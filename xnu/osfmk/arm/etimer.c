@@ -31,10 +31,12 @@
  * ARM event timer.
  */
 
+#include <arm/arch.h>
 #include <mach/mach_types.h>
 
 #include <kern/clock.h>
 #include <kern/thread.h>
+#include <kern/timer.h>
 #include <kern/timer_queue.h>
 #include <kern/processor.h>
 #include <kern/macro_help.h>
@@ -48,6 +50,16 @@
 
 #ifndef __LP64__
 
+static inline void timer_memory_barrier(void)
+{
+#if defined(_ARM_ARCH_7)
+    __asm__ __volatile__("dmb ish" ::: "memory");
+#else
+    __asm__ __volatile__("mcr p15, 0, %0, c7, c10, 5"
+                         :: "r" (0) : "memory");
+#endif
+}
+
 /**
  * timer_grab
  *
@@ -55,24 +67,19 @@
  */
 uint64_t timer_grab(timer_t timer)
 {
-#if defined(BOARD_CONFIG_QSD8250_LEO)
     /* The shared accumulator follows tstamp. A stable high/check pair
      * protects a carry publication; low-only updates are atomic32 stores. */
     volatile struct timer *value = timer;
     uint32_t high, low, check;
     do {
         high = value->high_bits;
-        __asm__ __volatile__("dmb ish" ::: "memory");
+        timer_memory_barrier();
         low = value->low_bits;
-        __asm__ __volatile__("dmb ish" ::: "memory");
+        timer_memory_barrier();
         check = value->high_bits_check;
     } while (high != check);
     return ((uint64_t)high << 32) | low;
-#else
-    return *(uint64_t *) timer;
-#endif
 }
-#endif
 
 /**
  * timer_update
@@ -81,21 +88,17 @@ uint64_t timer_grab(timer_t timer)
  */
 void timer_update(timer_t timer, uint32_t new_high, uint32_t new_low)
 {
-#if defined(BOARD_CONFIG_QSD8250_LEO)
     /* Shared callers serialize writes with scheduler IRQ exclusion; private
      * idle snapshots need no new lock. Publish check, low, then high, matching
      * kern/timer.h and its original 32-bit hardware-interface protocol. */
     volatile struct timer *value = timer;
     value->high_bits_check = new_high;
-    __asm__ __volatile__("dmb ish" ::: "memory");
+    timer_memory_barrier();
     value->low_bits = new_low;
-    __asm__ __volatile__("dmb ish" ::: "memory");
+    timer_memory_barrier();
     value->high_bits = new_high;
-#else
-    uint64_t *ptr = (uint64_t *) timer;
-    *ptr = ((uint64_t) (new_high) << 32) | new_low;
-#endif
 }
+#endif /* !__LP64__ */
 
 /**
  * etimer_set_deadline
@@ -128,12 +131,9 @@ void etimer_set_deadline(uint64_t deadline)
 void etimer_resync_deadlines(void)
 {
     uint64_t deadline;
-    uint64_t pmdeadline;
     rtclock_timer_t *mytimer;
     spl_t s = splclock();
     cpu_data_t *pp;
-    uint32_t decr;
-    uint64_t now;
 
     pp = current_cpu_datap();
     deadline = EndOfAllTime;
@@ -151,14 +151,8 @@ void etimer_resync_deadlines(void)
      */
 
     if (deadline > 0 && deadline <= pp->rtcPop) {
-        now = mach_absolute_time();
-        decr = setPop(deadline);
-
-        if (deadline < now) {
-            pp->rtcPop = now + decr;
-        } else {
-            pp->rtcPop = deadline;
-        }
+        /* setPop records the actual deadline after decrementer clamping. */
+        (void)setPop(deadline);
     }
 
     splx(s);
@@ -179,6 +173,7 @@ void etimer_intr(int inuser, uint64_t iaddr)
 
     pp = current_cpu_datap();
 
+    pp->timer_cnt++;
     SCHED_STATS_TIMER_POP(current_processor());
 
     abstime = mach_absolute_time(); /* Get the time now */
@@ -189,6 +184,9 @@ void etimer_intr(int inuser, uint64_t iaddr)
     mytimer = &pp->rt_timer;    /* Point to the event timer */
     if (mytimer->deadline <= abstime) {
         mytimer->has_expired = TRUE;    /* Remember that we popped */
+        /* Callouts may requeue themselves; the consumed deadline must no
+         * longer suppress their new deadline in timer_queue_assign(). */
+        mytimer->deadline = EndOfAllTime;
         mytimer->deadline = timer_queue_expire(&mytimer->queue, abstime);
         mytimer->has_expired = FALSE;
     }

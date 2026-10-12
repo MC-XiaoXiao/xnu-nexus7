@@ -61,6 +61,22 @@ EnterARM(_start)
     beq     mmu_initialized
 
 mmu_reinitialize:
+#if defined(BOARD_CONFIG_TEGRA30_NEXUS7)
+    /* Establish coherency before the master enables its data cache. The
+     * loader has already cleaned and disabled the inherited caches. */
+    movw    r4, #0x0000
+    movt    r4, #0x5004
+    movw    r5, #0xffff
+    str     r5, [r4, #0xc]
+    ldr     r5, [r4]
+    orr     r5, r5, #1
+    str     r5, [r4]
+    dsb     sy
+    mrc     p15, 0, r5, c1, c0, 1
+    orr     r5, r5, #0x41
+    mcr     p15, 0, r5, c1, c0, 1
+    isb     sy
+#endif
     /*
      * MMU initialization part begins here. -----------------------
      *

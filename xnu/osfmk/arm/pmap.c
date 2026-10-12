@@ -132,6 +132,7 @@
 #include <kern/cpu_number.h>
 #include <kern/thread.h>
 #include <arm/pmap.h>
+#include <arm/PlatformConfigs.h>
 #include <arm/mp.h>
 #include <arm/misc_protos.h>
 #include <kern/ledger.h>
@@ -206,8 +207,19 @@ vm_page_t commpage;
 /* PC lab compatibility alias for original iOS 7 ARMv7 userspace. */
 #define IOS7LAB_COMMPAGE_ALIAS 0xFFFF4000U
 #endif
-uint64_t pmap_nesting_size_min = 0x8000000;
-uint64_t pmap_nesting_size_max = 0x8000000;
+uint64_t pmap_nesting_size_min = 0x100000;
+uint64_t pmap_nesting_size_max = 0x10000000;
+
+static void pmap_configure_nesting(void)
+{
+    unsigned int user_darwin = 13;
+    /* Accept the old boot-tool spelling during migration. */
+    if (!PE_parse_boot_argn("arm_user_darwin", &user_darwin, sizeof(user_darwin)))
+        PE_parse_boot_argn("nexus7_user_darwin", &user_darwin, sizeof(user_darwin));
+    if (user_darwin != 13 && user_darwin != 14)
+        panic("pmap: arm_user_darwin must be 13 or 14");
+    pmap_nesting_size_min = user_darwin == 13 ? 0x100000 : 0x400000;
+}
 
 int allow_data_exec = 0;        /* no exec from data, embedded is hardcore like that */
 int allow_stack_exec = 0;       /* No apps may execute from the stack by default */
@@ -231,6 +243,12 @@ lock_t pmap_system_lock;
 }
 
 #define ppn_to_pai
+
+/* Cortex-A9 table walks are not coherent with dirty L1 D-cache lines.
+ * Publish descriptors to PoC before invalidating translations or using a new
+ * TTBR. A DSB alone only orders accesses; it does not clean those lines. */
+#define FLUSH_PTE(pte_p) arm_dcache_wb_range((vm_offset_t)(pte_p), sizeof(pt_entry_t))
+#define FLUSH_PTE_RANGE(spte, epte) arm_dcache_wb_range((vm_offset_t)(spte), (vm_size_t)((vm_offset_t)(epte) - (vm_offset_t)(spte)))
 
 /** The Free List. */
 pv_entry_t pv_free_list;        /* The free list should be populated when the pmaps are not locked. */
@@ -363,6 +381,8 @@ typedef enum {
     PMAP_OSPTE_TYPE_NOENCRYPT = 0x8,
     PMAP_OSPTE_TYPE_NOCACHE = 0x10,
     PMAP_OSPTE_TYPE_PTA = 0x20,
+    PMAP_OSPTE_TYPE_CACHE_SET = 0x40,
+    PMAP_OSPTE_TYPE_RECLAIMED = 0x80,
 } __internal_pmap_ospte_bits_t;
 
 /*
@@ -649,8 +669,8 @@ typedef enum {
  *    1 0   Write through, no write alloc, buffered
  *    1 1   Write back, no write alloc, buffered
  */
-#define ARM_L2_C_BIT            0x00000004
-#define ARM_L2_B_BIT            0x00000008
+#define ARM_L2_C_BIT            0x00000008
+#define ARM_L2_B_BIT            0x00000004
 #define ARM_L2_4KB_TEX(x)       ((x & 0x7) << 6)  /* Type Extension */
 
 #define ARM_CACHEBIT_NONE_NO_BUFFERED         0
@@ -1103,14 +1123,16 @@ static inline void pmap_pagetable_corruption_log_setup(void)
  */
 uint32_t pmap_vm_prot_to_page_flags(pmap_t pmap, vm_prot_t prot, int wired, int nx)
 {
-    arm_l2_t *current_l2 = &arm_pte_prot_templates[0];
     pt_entry_t pte = 0;
 
     /*
      * Pmaps other than the kernel one will always have user accessible pages.
      */
     if (pmap != kernel_pmap)
-        pte |= L2_ACCESS_USER;
+        /* User translations belong to their ASID. TLBIASID deliberately
+         * preserves global entries, so leaving nG clear retains stale
+         * read-only/COW translations after a successful write fault. */
+        pte |= L2_ACCESS_USER | L2_NG_BIT;
     pte |= L2_ACCESS_PRW;
 
     /*
@@ -1124,7 +1146,7 @@ uint32_t pmap_vm_prot_to_page_flags(pmap_t pmap, vm_prot_t prot, int wired, int 
     /*
      * Enforce XN if necessary.
      */
-    if (!(prot & VM_PROT_EXECUTE))
+    if (nx_enabled && pmap->pm_nx && !(prot & VM_PROT_EXECUTE))
         pte |= L2_NX_BIT;       /* XN-bit, R?X */
 
     return pte;
@@ -1489,6 +1511,7 @@ kern_return_t arm_fast_fault(pmap_t pmap, vm_map_offset_t va,
         pte |= L2_ACCESS_APX;
     entry->fault_access = access;
     *ptep = pte;
+    FLUSH_PTE(ptep);
     arm_drain_writebuf();
     pmap_flush_tlbs(pmap, va, va + PAGE_SIZE);
     result = KERN_SUCCESS;
@@ -1507,50 +1530,81 @@ kern_return_t arm_fast_fault(pmap_t pmap, vm_map_offset_t va,
  */
 kern_return_t pmap_attribute_cache_sync(ppnum_t pn, vm_size_t size, vm_machine_attribute_t attr, vm_machine_attribute_val_t * attrp)
 {
-    Debugger("pmap_attribute_cache_sync");
+    if (size > PAGE_SIZE)
+        panic("pmap_attribute_cache_sync size: 0x%x", size);
+    pmap_sync_page_data_phys(pn);
     return KERN_SUCCESS;
 }
 
-/**
- * pmap_get_cache_attributes
- */
-unsigned int pmap_get_cache_attributes(ppnum_t pn) {
-    /* If the pmap subsystem isn't up, just assume writethrough cache. */
-    if(!pmap_initialized)
-        return (ARM_CACHEBIT_WT_NWA_BUFFERED << 2) | (ARM_L2_4KB_TEX(ARM_L2_TEX_100 | ARM_CACHEBIT_WT_NWA_BUFFERED));
+/* Cache mode belongs to the physical page, independently of its aliases.
+ * Keep it above the existing software page flags; no public ABI changes. */
+#define PMAP_CACHE_MODE_SHIFT 8
+#define PMAP_CACHE_MODE_MASK (VM_WIMG_MASK << PMAP_CACHE_MODE_SHIFT)
 
-    /* If it's out of memory, assume it's not cacheable at all. */
-    if(!pmap_valid_page(pn))
-        return 0;
-
-    assert(pn != vm_page_fictitious_addr);
-    pv_rooted_entry_t pv_h = pai_to_pvh(pn);
-    assert(pv_h);
-
-    unsigned int attr = pv_h->flags;
-    unsigned int template = 0;
-    
-    if (attr & PMAP_OSPTE_TYPE_NOCACHE)
-        /* No cache, strongly ordered memory. */
-        template |= 0;
-    else
-        /* Assume writethrough, no write allocate for now. */
-        template |= (ARM_CACHEBIT_WT_NWA_BUFFERED << 2) | (ARM_L2_4KB_TEX(ARM_L2_TEX_100 | ARM_CACHEBIT_WT_NWA_BUFFERED));
-
-    return template;
+static unsigned int pmap_default_cache_mode(void)
+{
+#if __ARM_PROCESSOR_CLASS_CORTEX_A9__
+    /* Match arm_vm_init: Cortex-A9 exclusive accesses require cacheable RAM. */
+    return VM_WIMG_COPYBACK;
+#else
+    return VM_WIMG_WTHRU;
+#endif
 }
 
+static unsigned int pmap_cache_mode_to_pte(unsigned int mode)
+{
+    if (mode == VM_WIMG_WCOMB)
+        return ARM_L2_4KB_TEX(ARM_L2_TEX_100);
+    if (mode & VM_MEM_NOT_CACHEABLE)
+        return 0;
+    if (mode & VM_MEM_WRITE_THROUGH)
+        return (ARM_CACHEBIT_WT_NWA_BUFFERED << 2) |
+               ARM_L2_4KB_TEX(ARM_L2_TEX_100 | ARM_CACHEBIT_WT_NWA_BUFFERED);
+    return (ARM_CACHEBIT_WB_WA_BUFFERED << 2) |
+#if defined(_ARM_ARCH_7)
+           L2_S_BIT |
+#endif
+           ARM_L2_4KB_TEX(ARM_L2_TEX_100 | ARM_CACHEBIT_WB_WA_BUFFERED);
+}
 
-/**
- * pmap_cache_attributes
- */
 unsigned int pmap_cache_attributes(ppnum_t pn)
 {
-    if (!pmap_get_cache_attributes(pn) & ARM_L2_C_BIT)
-        return (VM_WIMG_IO);
-    else
-        return (VM_WIMG_COPYBACK);
+    unsigned int flags;
+
+    if (!pmap_initialized)
+        return pmap_default_cache_mode();
+    if (!pmap_valid_page(pn))
+        return VM_WIMG_IO;
+    flags = pai_to_pvh(pn)->flags;
+    if (flags & PMAP_OSPTE_TYPE_CACHE_SET)
+        return (flags & PMAP_CACHE_MODE_MASK) >> PMAP_CACHE_MODE_SHIFT;
+    if (flags & PMAP_OSPTE_TYPE_NOCACHE)
+        return VM_WIMG_IO;
+    return pmap_default_cache_mode();
 }
+
+unsigned int pmap_get_cache_attributes(ppnum_t pn)
+{
+    return pmap_cache_mode_to_pte(pmap_cache_attributes(pn));
+}
+
+static unsigned int pmap_enter_cache_attributes(ppnum_t pn, unsigned int flags)
+{
+    /* iOS 6 uses the physical-page policy only for a zero low byte.
+     * Explicit mapping modes do not change that policy for other aliases. */
+    unsigned int mode = flags & VM_WIMG_MASK;
+    if (!mode)
+        return pmap_get_cache_attributes(pn);
+    switch (mode) {
+    case VM_WIMG_IO:
+    case VM_WIMG_WCOMB:
+    case VM_WIMG_WTHRU:
+        return pmap_cache_mode_to_pte(mode);
+    default:
+        return pmap_cache_mode_to_pte(pmap_default_cache_mode());
+    }
+}
+
 
 /**
  * pmap_clear_noencrypt
@@ -1589,6 +1643,16 @@ void pmap_set_noencrypt(ppnum_t pn)
 void
 pmap_flush_tlbs(pmap_t  pmap, vm_map_offset_t startv, vm_map_offset_t endv)
 {
+#if defined(_ARM_ARCH_7)
+    unsigned int mpidr, zero = 0;
+    __asm__ volatile("mrc p15, 0, %0, c0, c0, 5" : "=r"(mpidr));
+    /* MP extensions provide a synchronous inner-shareable TLB broadcast. */
+    if ((mpidr & 0xc0000000U) == 0x80000000U) {
+        __asm__ volatile("dsb ishst\n mcr p15, 0, %0, c8, c3, 0\n dsb ish\n isb"
+                         :: "r"(zero) : "memory");
+        return;
+    }
+#endif
     unsigned int    cpu;
     unsigned int    cpu_bit;
     unsigned int    my_cpu = cpu_number();
@@ -1650,51 +1714,50 @@ pmap_flush_tlbs(pmap_t  pmap, vm_map_offset_t startv, vm_map_offset_t endv)
 
 static uint32_t cacheability_mask = ~((ARM_L2_TEX_011 << 2) | ARM_L2_4KB_TEX(ARM_L2_TEX_111));
 
+static void pmap_update_cache_pte(pmap_t pmap, vm_map_offset_t va,
+                                  pt_entry_t *ptep, unsigned int attributes)
+{
+    pt_entry_t old = *ptep;
+    pt_entry_t updated = (old & cacheability_mask) | attributes;
+
+    if (updated == old)
+        return;
+    /* Retire the old memory type before publishing the new descriptor. */
+    *ptep = 0;
+    FLUSH_PTE(ptep);
+    arm_drain_writebuf();
+    pmap_flush_tlbs(pmap, va, va + PAGE_SIZE);
+    *ptep = updated;
+    FLUSH_PTE(ptep);
+    arm_drain_writebuf();
+    pmap_flush_tlbs(pmap, va, va + PAGE_SIZE);
+}
+
 void
-pmap_update_cache_attributes_locked(ppnum_t pn, unsigned attributes) {
-    pv_rooted_entry_t pv_h, pv_e;
-    pv_hashed_entry_t pvh_e, nexth;
-    vm_map_offset_t vaddr;
-    pmap_t  pmap;
-    pt_entry_t  *ptep;
+pmap_update_cache_attributes_locked(ppnum_t pn, unsigned attributes)
+{
+    pv_rooted_entry_t head = pai_to_pvh(pn), entry;
+    vm_map_offset_t va;
+    pt_entry_t *ptep;
 
-    pv_h = pai_to_pvh(pn);
-    /* 
-     * TODO: translate the PHYS_* bits to PTE bits, while they're
-     * currently identical, they may not remain so
-     * Potential optimization (here and in page_protect),
-     * parallel shootdowns, check for redundant
-     * attribute modifications.
-     */
-    
-    /*
-     * Alter attributes on all mappings
-     */
-    if (pv_h->pmap != PMAP_NULL) {
-        pv_e = pv_h;
-        pvh_e = (pv_hashed_entry_t)pv_e;
-
+    if (head->pmap != PMAP_NULL) {
+        entry = head;
         do {
-            pmap = pv_e->pmap;
-            vaddr = pv_e->va;
-            ptep = (pt_entry_t *)pmap_pte(pmap, vaddr);
-        
-            if (ptep == 0)
-                panic("pmap_update_cache_attributes_locked: Missing PTE, pmap: %p, pn: 0x%x vaddr: 0x%x kernel_pmap: %p", pmap, pn, vaddr, kernel_pmap);
-
-            nexth = (pv_hashed_entry_t)queue_next(&pvh_e->qlink);
-
-            /*
-             * Update PTE.
-             */
-            pt_entry_t* cpte = (pt_entry_t*)ptep;
-            *cpte &= cacheability_mask;
-            *cpte |= attributes;
-            pmap_flush_tlbs(pmap, vaddr, vaddr + PAGE_SIZE);
-
-            pvh_e = nexth;
-        } while ((pv_e = (pv_rooted_entry_t)nexth) != pv_h);
+            ptep = (pt_entry_t *)pmap_pte(entry->pmap, entry->va);
+            if (!ptep || !(*ptep & ARM_PTE_DESCRIPTOR_4K) ||
+                ((*ptep & L2_ADDR_MASK) >> PAGE_SHIFT) != pn)
+                panic("pmap_update_cache_attributes_locked: invalid PV mapping");
+            pmap_update_cache_pte(entry->pmap, entry->va, ptep, attributes);
+            entry = (pv_rooted_entry_t)queue_next(&entry->qlink);
+        } while (entry != head);
     }
+
+    /* Bootstrap's physical linear map is deliberately outside the PV list. */
+    va = phys_to_virt(pn << PAGE_SHIFT);
+    ptep = (pt_entry_t *)pmap_pte(kernel_pmap, va);
+    if (ptep && (*ptep & ARM_PTE_DESCRIPTOR_4K) &&
+        ((*ptep & L2_ADDR_MASK) >> PAGE_SHIFT) == pn)
+        pmap_update_cache_pte(kernel_pmap, va, ptep, attributes);
 }
 
 
@@ -1705,46 +1768,35 @@ pmap_update_cache_attributes_locked(ppnum_t pn, unsigned attributes) {
  */
 void pmap_set_cache_attributes(ppnum_t pn, unsigned int cacheattr)
 {
-    unsigned int current, template = 0;
-    int pai;
+    pv_rooted_entry_t head;
+    unsigned int old, attributes;
 
-    if (cacheattr & VM_MEM_NOT_CACHEABLE) {
-        /*
-         * Template of 0 is non-cacheable, strongly ordered memory.
-         */
-        template &= cacheability_mask;
-    } else {
-        /*
-         * Writethrough.
-         */
-        if(cacheattr == VM_WIMG_WTHRU)
-            template |= (ARM_CACHEBIT_WT_NWA_BUFFERED << 2) | (ARM_L2_4KB_TEX(ARM_L2_TEX_100 | ARM_CACHEBIT_WT_NWA_BUFFERED));
-        /*
-         * Writecombine/copyback = writeback.
-         */
-        else if(cacheattr == VM_WIMG_WCOMB || cacheattr == VM_WIMG_COPYBACK)
-            template |= (ARM_CACHEBIT_WB_WA_BUFFERED << 2) | (ARM_L2_4KB_TEX(ARM_L2_TEX_100 | ARM_CACHEBIT_WB_WA_BUFFERED));
-    }
-
-    /*
-     * On MP systems, interrupts must be enabled.
-     */
+    assert((pn != vm_page_fictitious_addr) && (pn != vm_page_guard_addr));
+    if (!pmap_initialized || !pmap_valid_page(pn))
+        return;
     if (processor_avail_count > 1 && !ml_get_interrupts_enabled())
         panic("interrupts must be enabled for pmap_set_cache_attributes");
 
-    assert((pn != vm_page_fictitious_addr) && (pn != vm_page_guard_addr));
+    cacheattr &= VM_WIMG_MASK;
+    if (!cacheattr || (cacheattr & VM_WIMG_USE_DEFAULT))
+        cacheattr = pmap_default_cache_mode();
+    attributes = pmap_cache_mode_to_pte(cacheattr);
 
-    LOCK_PVH(pai);
-    pmap_update_cache_attributes_locked(pn, template);
-
-    if(cacheattr & VM_MEM_NOT_CACHEABLE)
-        phys_attribute_set(pn, PMAP_OSPTE_TYPE_NOCACHE);
-    else 
-        phys_attribute_clear(pn, PMAP_OSPTE_TYPE_NOCACHE);
-
-    UNLOCK_PVH(pai);
-
-    return;
+    LOCK_PVH(pn);
+    old = pmap_get_cache_attributes(pn);
+    if (old != attributes) {
+        /* Include every virtual alias before changing the memory type. */
+        arm_dcache_wbinv_all();
+        pmap_update_cache_attributes_locked(pn, attributes);
+    }
+    head = pai_to_pvh(pn);
+    head->flags = (head->flags & ~PMAP_CACHE_MODE_MASK) |
+                  (cacheattr << PMAP_CACHE_MODE_SHIFT) | PMAP_OSPTE_TYPE_CACHE_SET;
+    if (cacheattr & VM_MEM_NOT_CACHEABLE)
+        head->flags |= PMAP_OSPTE_TYPE_NOCACHE;
+    else
+        head->flags &= ~PMAP_OSPTE_TYPE_NOCACHE;
+    UNLOCK_PVH(pn);
 }
 
 /**
@@ -2060,6 +2112,7 @@ void pmap_change_wiring(pmap_t map, vm_map_offset_t va, boolean_t wired)
     if (wired) {
         /* A wired mapping must no longer depend on pageable VM faults. */
         *pte = (*pte & ~PMAP_ACCESS_MASK) | (entry->fault_access & PMAP_ACCESS_MASK);
+        FLUSH_PTE(pte);
         entry->fault_access &= ~(PMAP_FAULT_REF | PMAP_FAULT_MOD);
         if (managed) {
             phys_attribute_set(pn, PMAP_OSPTE_TYPE_REFERENCED);
@@ -2083,10 +2136,8 @@ void pmap_change_wiring(pmap_t map, vm_map_offset_t va, boolean_t wired)
  */
 vm_offset_t pmap_tte(pmap_t pmap, vm_offset_t virt)
 {
-    uint32_t tte_offset_begin;
-    tte_offset_begin = pmap->pm_l1_virt;
-    if ((tte_offset_begin + L1_SIZE) < addr_to_tte(pmap->pm_l1_virt, virt))
-        panic("Translation table entry extends past L1 size (base: 0x%08X)", tte_offset_begin);
+    if ((virt >> L1SHIFT) >= pmap->pm_l1_size / sizeof(pt_entry_t))
+        return 0;
     return addr_to_tte(pmap->pm_l1_virt, virt);
 }
 
@@ -2095,24 +2146,16 @@ vm_offset_t pmap_tte(pmap_t pmap, vm_offset_t virt)
  */
 vm_offset_t pmap_pte(pmap_t pmap, vm_offset_t virt)
 {
-    uint32_t *tte_offset = (uint32_t *) pmap_tte(pmap, virt);
+    uint32_t *tte_offset;
     uint32_t tte, pte, *ptep;
 
-    /*
-     * Get the translation-table entry. 
-     */
-    assert(tte_offset);
-    tte = *tte_offset;
-
-    /*
-     * If the requested PTE entry is required is indeed the commonpage and
-     * we are not the kernel pmap, quit.
-     * 
-     * This is because the TTBCR is set to 4kB, and all higher page table
-     * address accesses will go to the kernel.
-     */
-    if (pmap != kernel_pmap && virt >= _COMM_PAGE_BASE_ADDRESS)
+    /* Reject kernel addresses before touching a user translation table. */
+    if (pmap != kernel_pmap && virt >= VM_MAX_ADDRESS)
         return 0;
+    tte_offset = (uint32_t *)pmap_tte(pmap, virt);
+    if (!tte_offset)
+        return 0;
+    tte = *tte_offset;
 
     /*
      * Verify it's not a section mapping. 
@@ -2120,6 +2163,9 @@ vm_offset_t pmap_pte(pmap_t pmap, vm_offset_t virt)
     if ((tte & ARM_PAGE_MASK_VALUE) == ARM_PAGE_SECTION) {
         panic("Translation table entry is a section mapping (tte %x ttep %p ttebv %x)!\n", tte, tte_offset, pmap->pm_l1_virt);
     }
+
+    if ((tte & ARM_PAGE_MASK_VALUE) != L1_TYPE_PTE)
+        return 0;
 
     /*
      * Clean the TTE bits off, get the address. 
@@ -2233,7 +2279,12 @@ vm_offset_t pmap_map(vm_offset_t virt, vm_map_offset_t start_addr, vm_map_offset
 
     ps = PAGE_SIZE;
     while (start_addr < end_addr) {
-        pmap_enter(kernel_pmap, (vm_map_offset_t) virt, (start_addr >> PAGE_SHIFT), prot, flags, FALSE, TRUE);
+        /* pmap_map creates ordinary kernel mappings. Keep the caller's
+         * cache flags in the flags slot; these mappings are not wired and
+         * have no fault-time write access override. */
+        pmap_enter(kernel_pmap, (vm_map_offset_t) virt,
+                   (start_addr >> PAGE_SHIFT), prot, VM_PROT_NONE,
+                   flags, FALSE);
         virt += ps;
         start_addr += ps;
     }
@@ -2262,7 +2313,7 @@ void pmap_zero_page(ppnum_t p)
     /*
      * Make sure the page is valid. 
      */
-    if (((p << PAGE_SHIFT) < avail_start) || ((p << PAGE_SHIFT) > avail_end))
+    if (!pmap_valid_page(p))
         panic("pmap_zero_page: zeroing a non-managed page, ppnum %d", p);
 
     bzero((void *)phys_to_virt(p << PAGE_SHIFT), PAGE_SIZE);
@@ -2313,6 +2364,7 @@ void pmap_clear_refmod(ppnum_t pn, unsigned int mask)
                 *pte |= L2_ACCESS_APX;
             if (bits & PMAP_OSPTE_TYPE_MODIFIED)
                 entry->fault_access |= PMAP_FAULT_MOD;
+            FLUSH_PTE(pte);
             arm_drain_writebuf();
             pmap_flush_tlbs(entry->pmap, entry->va, entry->va + PAGE_SIZE);
             entry = (pv_rooted_entry_t)queue_next(&entry->qlink);
@@ -2351,6 +2403,8 @@ vm_offset_t io_map(vm_offset_t phys_addr, vm_size_t size, unsigned int flags)
 
 vm_offset_t io_map_spec(vm_map_offset_t phys_addr, vm_size_t size, unsigned int flags)
 {
+    if (phys_addr > UINT32_MAX)
+        return 0;
     return (io_map(phys_addr, size, flags));
 }
 
@@ -2421,17 +2475,27 @@ boolean_t pmap_map_bd(vm_offset_t virt, vm_map_offset_t start, vm_map_offset_t e
 #endif
     SPLVM(spl);
 
-    /*
-     * Write the PTEs to memory. 
-     */
-    uint32_t ptep = (uint32_t) (pmap_pte(kernel_pmap, virt));
-    if (!ptep)
-        panic("pmap_map_bd: Invalid kernel address");
-
-    /*
-     * Map the pages. 
-     */
-    l2_map_linear_range_no_cache(virt_to_phys(ptep), start, end);
+    /* Bootstrap I/O mappings are uncached. Walk each L2 separately: a
+     * virtual range may cross tables that are not physically adjacent.
+     * Publish descriptors and retire stale translations before MMIO use. */
+    vm_offset_t original_virt = virt;
+    vm_map_offset_t physical;
+    for (physical = start; physical < end; physical += PAGE_SIZE) {
+        pt_entry_t *ptep = (pt_entry_t *)pmap_pte(kernel_pmap, virt);
+        if (!ptep)
+            panic("pmap_map_bd: Invalid kernel address");
+        /* The early mapper is for data/MMIO, as in iOS 6: always XN and
+         * writable only when requested. Cache flags do not alter this path. */
+        *ptep = (physical & L2_ADDR_MASK) | L2_SMALL_PAGE |
+                L2_ACCESS_PRW | L2_NX_BIT |
+                ((prot & VM_PROT_WRITE) ? 0 : L2_ACCESS_APX);
+        FLUSH_PTE(ptep);
+        virt += PAGE_SIZE;
+    }
+    if (start < end) {
+        arm_drain_writebuf();
+        pmap_flush_tlbs(kernel_pmap, original_virt, virt);
+    }
 
     /*
      * Return. 
@@ -2497,7 +2561,57 @@ void pmap_set_reference(ppnum_t pn)
 boolean_t pmap_valid_page(ppnum_t p)
 {
     uint64_t pa = (uint64_t)p << PAGE_SHIFT;
-    return (pa >= avail_start && pa < avail_end);
+    if (pa >= avail_start && pa < avail_end)
+        return TRUE;
+#if !BOARD_CONFIG_QSD8250_LEO
+    /* Boot-reserved RAM enters VM only through explicit static reclamation. */
+    if (pmap_initialized && pa >= gPhysBase && pa < avail_start &&
+        pa < avail_end && pa - gPhysBase < mem_size)
+        return (pai_to_pvh(p)->flags & PMAP_OSPTE_TYPE_RECLAIMED) != 0;
+#endif
+    return FALSE;
+}
+
+/* Claim a boot-reserved RAM page exactly once before vm_page_create publishes it.
+ * Ordinary VM pages and device memory must never be recreated through this API. */
+boolean_t pmap_claim_bootstrap_page(ppnum_t pn)
+{
+#if BOARD_CONFIG_QSD8250_LEO
+    return FALSE;
+#else
+    uint64_t pa = (uint64_t)pn << PAGE_SHIFT;
+    pv_rooted_entry_t root;
+    pv_hashed_entry_t alias;
+    unsigned int bucket;
+    boolean_t claimed = FALSE;
+
+    if (!pmap_initialized || pa < gPhysBase || pa >= avail_start ||
+        pa >= avail_end || mem_size < PAGE_SIZE ||
+        pa - gPhysBase > mem_size - PAGE_SIZE)
+        return FALSE;
+    PMAP_LOCK(kernel_pmap);
+    LOCK_PVH(pn);
+    root = pai_to_pvh(pn);
+    if (!(root->flags & PMAP_OSPTE_TYPE_RECLAIMED)) {
+        if (root->pmap != PMAP_NULL)
+            panic("pmap_claim_bootstrap_page: active physical root");
+        /* Reserved pages previously used the unmanaged hash. A live tracked
+         * alias is an ownership violation, not memory available to the VM. */
+        for (bucket = 0; bucket <= npvhash; bucket++) {
+            LOCK_PV_HASH(bucket);
+            for (alias = *pvhash(bucket); alias; alias = alias->nexth) {
+                if (alias->ppn == pn)
+                    panic("pmap_claim_bootstrap_page: active mapping alias");
+            }
+            UNLOCK_PV_HASH(bucket);
+        }
+        root->flags |= PMAP_OSPTE_TYPE_RECLAIMED;
+        claimed = TRUE;
+    }
+    UNLOCK_PVH(pn);
+    PMAP_UNLOCK(kernel_pmap);
+    return claimed;
+#endif
 }
 
 /**
@@ -2535,7 +2649,15 @@ void pmap_sync_page_data_phys(ppnum_t pa)
     uint64_t physical = (uint64_t)pa << PAGE_SHIFT;
     if (physical >= gPhysBase && mem_size >= PAGE_SIZE &&
         physical - gPhysBase <= mem_size - PAGE_SIZE) {
+#if __ARM_PROCESSOR_CLASS_CORTEX_A9__
+        /* Cortex-A9 I-cache is VIPT: the kernel linear alias can have a
+         * different colour from user text. A VA-range invalidation of that
+         * alias does not discard every cached copy of this physical page. */
+        arm_dcache_wb_range(phys_to_virt((vm_offset_t)physical), PAGE_SIZE);
+        arm_icache_inv_all();
+#else
         arm_icache_sync_range(phys_to_virt((vm_offset_t)physical), PAGE_SIZE);
+#endif
     } else {
         /* No linear mapping: publish dirty data before invalidating I-cache. */
         arm_icache_sync_all();
@@ -2549,8 +2671,12 @@ void pmap_sync_page_data_phys(ppnum_t pa)
  */
 void pmap_sync_page_attributes_phys(ppnum_t pa)
 {
-    Debugger("pmap_sync_page_attributes_phys");
-    return;
+    uint64_t physical = (uint64_t)pa << PAGE_SHIFT;
+    if (physical >= gPhysBase && mem_size >= PAGE_SIZE &&
+        physical - gPhysBase <= mem_size - PAGE_SIZE)
+        arm_dcache_wbinv_range(phys_to_virt((vm_offset_t)physical), PAGE_SIZE);
+    else
+        arm_dcache_wbinv_all();
 }
 
 /*
@@ -2573,7 +2699,80 @@ int pmap_resident_count(pmap_t pmap)
  */
 void pmap_disable_NX(pmap_t pmap)
 {
-    panic("pmap_disable_NX not implemented\n");
+    pmap->pm_nx = FALSE;
+}
+
+/* Static bootstrap memory keeps its physical-linear mapping when reclaimed.
+ * Unlike pmap_protect, this interface may restore kernel write permission. */
+kern_return_t ml_static_protect(vm_offset_t vaddr, vm_size_t size, vm_prot_t prot)
+{
+    uint64_t end = ((uint64_t)vaddr + size) & ~(uint64_t)PAGE_MASK;
+    uint64_t at;
+    pt_entry_t *tte, *pte, old, updated, permissions = L2_ACCESS_PRW;
+    kern_return_t result = KERN_SUCCESS;
+    boolean_t changed = FALSE, managed;
+    ppnum_t pn;
+#if !BOARD_CONFIG_QSD8250_LEO
+    pv_rooted_entry_t entry;
+#endif
+
+    if (vaddr < VM_MIN_KERNEL_ADDRESS || end > (1ULL << 32))
+        return KERN_FAILURE;
+    assert(!(vaddr & PAGE_MASK));
+    if (!(prot & VM_PROT_WRITE))
+        permissions |= L2_ACCESS_APX;
+    if (!(prot & VM_PROT_EXECUTE))
+        permissions |= L2_NX_BIT;
+
+    PMAP_LOCK(kernel_pmap);
+    for (at = vaddr; at < end; at += PAGE_SIZE) {
+        tte = (pt_entry_t *)pmap_tte(kernel_pmap, (vm_offset_t)at);
+        if ((*tte & ARM_PAGE_MASK_VALUE) == ARM_PAGE_SECTION) {
+            result = KERN_FAILURE;
+            break;
+        }
+        pte = (pt_entry_t *)pmap_pte(kernel_pmap, (vm_offset_t)at);
+        if (!pte || !(*pte & ARM_PTE_DESCRIPTOR_4K))
+            continue;
+        old = *pte;
+        pn = pa_index(old & L2_ADDR_MASK);
+        managed = pmap_initialized && pmap_valid_page(pn);
+        if (managed)
+            LOCK_PVH(pn);
+        updated = (old & ~(PMAP_ACCESS_MASK | L2_NX_BIT)) | permissions;
+        if ((old & L2_NX_BIT) && !(updated & L2_NX_BIT))
+            pmap_sync_page_data_phys(pn);
+#if !BOARD_CONFIG_QSD8250_LEO
+        if (pmap_initialized) {
+            entry = pmap_find_pv(kernel_pmap, pn, (vm_map_offset_t)at);
+            if (entry) {
+                entry->fault_access =
+                    (entry->fault_access & ~(PMAP_ACCESS_MASK | L2_NX_BIT |
+                                             PMAP_FAULT_REF | PMAP_FAULT_MOD)) |
+                    permissions;
+            }
+        }
+#endif
+        if (managed) {
+            phys_attribute_set(pn, PMAP_OSPTE_TYPE_REFERENCED);
+            if (prot & VM_PROT_WRITE)
+                phys_attribute_set(pn, PMAP_OSPTE_TYPE_MODIFIED);
+        }
+        if (old != updated) {
+            *pte = updated;
+            FLUSH_PTE(pte);
+            changed = TRUE;
+        }
+        if (managed)
+            UNLOCK_PVH(pn);
+    }
+    if (changed) {
+        arm_drain_writebuf();
+        pmap_flush_tlbs(kernel_pmap, vaddr,
+                        end == (1ULL << 32) ? UINT32_MAX : (vm_map_offset_t)end);
+    }
+    PMAP_UNLOCK(kernel_pmap);
+    return result;
 }
 
 extern void ovbcopy(void *from, void *to, vm_size_t len); /* TODO: Put this in a better place. */
@@ -2596,10 +2795,10 @@ void pmap_copy_page(ppnum_t src, ppnum_t dst)
  */
 void pmap_copy_part_page(ppnum_t src, vm_offset_t src_offset, ppnum_t dst, vm_offset_t dst_offset, vm_size_t len)
 {
-    assert((((dst << PAGE_SHIFT) & PAGE_MASK) + dst_offset + len) <= PAGE_SIZE);
-    assert((((src << PAGE_SHIFT) & PAGE_MASK) + src_offset + len) <= PAGE_SIZE);
+    assert(dst_offset <= PAGE_SIZE && len <= PAGE_SIZE - dst_offset);
+    assert(src_offset <= PAGE_SIZE && len <= PAGE_SIZE - src_offset);
 
-    ovbcopy((void *)(phys_to_virt(src << PAGE_SHIFT) + src_offset), (void *)(phys_to_virt(dst << PAGE_SHIFT) + src_offset), len);
+    ovbcopy((void *)(phys_to_virt(src << PAGE_SHIFT) + src_offset), (void *)(phys_to_virt(dst << PAGE_SHIFT) + dst_offset), len);
 }
 
 /**
@@ -2613,8 +2812,12 @@ void pmap_common_init(pmap_t pmap)
     if (pmap->ledger)
         ledger_reference(pmap->ledger);
     pmap->pm_refcnt = 1;
-    pmap->pm_nx = 0;
+    pmap->pm_nx = TRUE;
     pmap->pm_shared = FALSE;
+    pmap->nested_pmap = PMAP_NULL;
+    pmap->nested_region_addr = 0;
+    pmap->nested_region_source = 0;
+    pmap->nested_region_size = 0;
     pmap->pm_stats.resident_count = 0;
     pmap->pm_stats.wired_count = 0;
 }
@@ -2670,97 +2873,52 @@ int pmap_list_resident_pages(pmap_t pmap, vm_offset_t * listp, int space)
  * pmap_find_phys returns the (4K) physical page number containing a
  * given virtual address in a given pmap.
  */
+/* Translate the requested pmap, independent of the currently installed
+ * TTBR and of temporary ref/mod access restrictions. The caller serializes
+ * table lifetime (pmap lock, or the existing UP/preemption-disabled path). */
+static vm_offset_t pmap_vtophys(pmap_t pmap, vm_offset_t virt)
+{
+    pt_entry_t *ttep, *ptep, tte, pte;
+
+    if (pmap == PMAP_NULL ||
+        (pmap != kernel_pmap && virt >= VM_MAX_ADDRESS))
+        return 0;
+    ttep = (pt_entry_t *)pmap_tte(pmap, virt);
+    if (!ttep)
+        return 0;
+    tte = *ttep;
+    if ((tte & ARM_PAGE_MASK_VALUE) == ARM_PAGE_SECTION) {
+        /* ARM short-descriptor section/supersection: 1MB/16MB. */
+        if (tte & (1U << 18)) {
+            /* Extended supersection PAs cannot fit this 32-bit pmap ABI. */
+            if (tte & 0x00f001e0U)
+                return 0;
+            return (tte & 0xff000000U) | (virt & 0x00ffffffU);
+        }
+        return (tte & L1_SECT_ADDR_MASK) | (virt & ~L1_SECT_ADDR_MASK);
+    }
+    if ((tte & ARM_PAGE_MASK_VALUE) != ARM_PAGE_PAGE_TABLE)
+        return 0;
+    ptep = (pt_entry_t *)(phys_to_virt(L1_PTE_ADDR(tte)) + pte_offset(virt));
+    pte = *ptep;
+    if (pte & ARM_PTE_DESCRIPTOR_4K)
+        return (pte & L2_ADDR_MASK) | (virt & PAGE_MASK);
+    if ((pte & ARM_PAGE_MASK_VALUE) == ARM_PTE_DESCRIPTOR_64K)
+        return (pte & 0xffff0000U) | (virt & 0xffffU);
+    return 0;
+}
+
 ppnum_t pmap_find_phys(pmap_t pmap, addr64_t va)
 {
-    spl_t spl;
-    uint32_t ptep, pte, ppn;
+    ppnum_t pn;
 
-    /*
-     * Raise priority level. 
-     */
+    if (va > UINT32_MAX)
+        return 0;
+    /* Keep this UP/debugger path independent of pmap spin locks. */
     disable_preemption();
-
-#if 1
-    /*
-     * Get the PTE. 
-     */
-    ptep = (uint32_t) pmap_pte(pmap, (vm_offset_t) va);
-    if (!ptep) {
-        ppn = 0;
-        goto out;
-    }
-    pte = (*(uint32_t *) (ptep));
-
-    /*
-     * Make sure it's a PTE. 
-     */
-    if (!((pte) & ARM_PTE_DESCRIPTOR_4K)) {
-        ppn = 0;
-        goto out;
-    }
-
-    ppn = pa_index(pte & L2_ADDR_MASK);
-#else
-    uint32_t virt = (va & L2_ADDR_MASK), par;
-    boolean_t is_priv = (pmap == kernel_pmap) ? TRUE : FALSE;
-
-    /*
-     * TTBCR split means that commonpage is at 0x40000000, in kernel_pmap.
-     */
-    if (virt == _COMM_PAGE_BASE_ADDRESS) {
-        ppn = 0;
-        goto out;
-    }
-
-    /*
-     * Fast VirtToPhys involves using the virtual address trnalsation
-     * register as present in Cortex-A and ARM11 MPCore systems.
-     *
-     * Privileged reads are only done on the kernel PMAP versus user
-     * pmaps getting user read/write state.
-     *
-     * The entire process should take much shorter compared to the
-     * older pmap_extract, which fully walked the page tables. You can
-     * still use the current behaviour however, by messing with
-     * the MASTER files.
-     *
-     * I swear, I need more stupid sleep.
-     */
-
-    /*
-     * Set the PAtoVA register and perform the operation.
-     */
-    if (is_priv)
-        armreg_va2pa_pr_ns_write(virt);
-    else
-        armreg_va2pa_ur_ns_write(virt);
-
-    /*
-     * Wait for the instruction transaction to complete.
-     */
-    __asm__ __volatile__("xisb sy");
-
-    /*
-     * See if the translation aborted, log any translation errors.
-     */
-    par = armreg_par_read();
-
-    /*
-     * Successful translation, we're done.
-     */
-    if (!(par & 1)) {
-        uint32_t pa = par & L2_ADDR_MASK;
-        ppn = pa_index(pa);
-    } else {
-        ppn = 0;
-    }
-#endif
- out:
-    /*
-     * Return. 
-     */
+    pn = pmap_vtophys(pmap, (vm_offset_t)va) >> PAGE_SHIFT;
     enable_preemption();
-    return ppn;
+    return pn;
 }
 
 /**
@@ -2843,6 +3001,25 @@ ppnum_t pmap_find_phys_fvtp(pmap_t pmap, addr64_t va)
  *
  * Switch the current user pmap to a new one.
  */
+/* Match the short-descriptor split to the allocated TTBR0 table. The
+ * kernel table is a safe, 16K-aligned bridge while TTBCR changes. */
+static void pmap_switch_user_ttb(pmap_t pmap)
+{
+#if BOARD_CONFIG_ARMPBA8 || BOARD_CONFIG_QSD8250_LEO
+    arm_context_switch(pmap->pm_l1_phys);
+#else
+    spl_t spl;
+    unsigned int n = pmap->pm_l1_size == PAGE_SIZE ? 2 : 1;
+    assert(pmap->pm_l1_size >= PAGE_SIZE);
+    assert(!(pmap->pm_l1_phys & (n == 2 ? PAGE_MASK : 0x1fff)));
+    SPLVM(spl);
+    arm_context_switch(kernel_pmap->pm_l1_phys);
+    set_mmu_ttbcr(n);
+    arm_context_switch(pmap->pm_l1_phys);
+    SPLX(spl);
+#endif
+}
+
 void pmap_switch(pmap_t new_pmap)
 {
     spl_t spl;
@@ -2858,19 +3035,17 @@ void pmap_switch(pmap_t new_pmap)
     if (new_pmap == kernel_pmap)
         goto switch_return;
 
-    /*
-     * Switch it if needed.
-     */
-    if (current_cpu_datap()->user_pmap == new_pmap) {
-        goto switch_return;
-    } else {
-        if (pmap_asid_ncpus) {
-            pmap_asid_activate(new_pmap, cpu_number());
-        }
-        current_cpu_datap()->user_pmap = new_pmap;
-        arm_set_context_id(new_pmap->pm_asid & 0xFF);
-        arm_context_switch(new_pmap->pm_l1_phys);
-    }
+    /* Like iOS 6, install the user table on every address-space switch.
+     * A cached pmap pointer may refer to a destroyed and recycled object,
+     * while TTBR0 still contains that object's former table address. */
+    PMAP_LOCK(new_pmap);
+    if (pmap_asid_ncpus)
+        pmap_asid_activate(new_pmap, cpu_number());
+    current_cpu_datap()->user_pmap = new_pmap;
+    arm_set_context_id(pmap_asid_ncpus ?
+        asid_for_pmap_cpu_tuple(new_pmap, cpu_number()) : new_pmap->pm_asid & 0xFF);
+    pmap_switch_user_ttb(new_pmap);
+    PMAP_UNLOCK(new_pmap);
 
     /*
      * Done.
@@ -3003,6 +3178,7 @@ extern long __stack_chk_guard[];
  */
 void pmap_bootstrap(__unused uint64_t msize, vm_offset_t * __first_avail, __unused unsigned int kmapsize)
 {
+    pmap_configure_nesting();
     /*
      * Set the first virtual address we can use. 
      */
@@ -3222,145 +3398,14 @@ void pmap_create_sharedpage(void)
  */
 vm_offset_t pmap_extract(pmap_t pmap, vm_offset_t virt)
 {
-#if defined(_ARM_ARCH_6)
-    spl_t spl;
-    vm_offset_t ppn = 0;
-    uint32_t tte, *ttep = pmap_tte(pmap, virt);
+    vm_offset_t pa;
 
-    /*
-     * Block off all interruptions. Nothing may interrupt the extraction process
-     * as the page tables may be changed by another callee to pmap_enter or such.
-     */
-
+    if (pmap == PMAP_NULL)
+        return 0;
     PMAP_LOCK(pmap);
-    if (!ttep)
-        goto extract_out;
-
-    /*
-     * Look at the TTE and see what type of mapping it is.
-     */
-    tte = *ttep;
-
-    /*
-     * Verify it's not a section mapping.
-     */
-    if ((tte & ARM_PAGE_MASK_VALUE) == ARM_PAGE_SECTION) {
-        /*
-         * Clean the lower bits off.
-         */
-        ppn = (tte & L1_SECT_ADDR_MASK);
-
-        /*
-         * Now add the lower bits back from the VA.
-         */
-        ppn |= (virt & ~(L1_SECT_ADDR_MASK));
-
-        /*
-         * Done. Address extraction successful.
-         */
-        goto extract_out;
-    } else if ((tte & ARM_PAGE_MASK_VALUE) == ARM_PAGE_PAGE_TABLE) {
-        uint32_t pte, *ptep;
-
-        /*
-         * Clean the TTE bits off, get the address of the L1 entry.
-         */
-        pte = L1_PTE_ADDR(tte);
-        if (!pte)
-            goto extract_out;
-
-        /*
-         * Return the virtually mapped PTE.
-         */
-        ptep = (uint32_t *) ((phys_to_virt(pte) + pte_offset(virt)));
-
-        /*
-         * Make sure it's not a large page. They're not supported yet, but they will 
-         * be at some point.
-         */
-        if (((*ptep & ARM_PAGE_MASK_VALUE) == ARM_PTE_DESCRIPTOR_64K))
-            panic("pmap_extract: 64kb pages not supported yet");
-
-        /*
-         * Clean the PTE bits off the address.
-         */
-        ppn = (*ptep) & L2_ADDR_MASK;
-
-        /*
-         * Now, add the lower bits back from the VA. 
-         */
-        ppn |= (virt & ~(L2_ADDR_MASK));
-
-        /*
-         * Done. Extraction successful.
-         */
-        goto extract_out;
-    } else {
-        kprintf("pmap_extract: invalid tte (ttep %x tte %x)\n", ttep, tte);
-    }
-
- extract_out:
-
-    /*
-     * Return.
-     */
+    pa = pmap_vtophys(pmap, virt);
     PMAP_UNLOCK(pmap);
-    return ppn;
-#elif defined(_ARM_ARCH_7)
-    uint32_t va = (virt & L2_ADDR_MASK), par;
-    boolean_t is_priv = (pmap == kernel_pmap) ? TRUE : FALSE;
-
-    /*
-     * Fast VirtToPhys involves using the virtual address trnalsation
-     * register as present in Cortex-A and ARM11 MPCore systems.
-     *
-     * Privileged reads are only done on the kernel PMAP versus user
-     * pmaps getting user read/write state.
-     *
-     * The entire process should take much shorter compared to the
-     * older pmap_extract, which fully walked the page tables. You can
-     * still use the current behaviour however, by messing with
-     * the MASTER files.
-     *
-     * I swear, I need more stupid sleep.
-     */
-
-    /*
-     * Set the PAtoVA register and perform the operation.
-     */
-    if (is_priv)
-        armreg_va2pa_pr_ns_write(va);
-    else
-        armreg_va2pa_ur_ns_write(va);
-
-    /*
-     * Wait for the instruction transaction to complete.
-     */
-    __asm__ __volatile__("isb sy");
-
-    /*
-     * See if the translation aborted, log any translation errors.
-     */
-    par = armreg_par_read();
-
-    /*
-     * Successful translation, we're done.
-     */
-    if (!(par & 1)) {
-        uint32_t pa = par & L2_ADDR_MASK;
-        pa |= (virt & ~(L2_ADDR_MASK));
-        return pa;
-    } else {
-        /*
-         * Log translation fault.
-         */
-        kprintf("pmap_extract: fast extraction failed, par 0x%x\n", par);
-    }
-
-    return 0;
-#else
-#error Unsupported subarchitecture
-#endif
+    return pa;
 }
 
 /** 
@@ -3368,75 +3413,88 @@ vm_offset_t pmap_extract(pmap_t pmap, vm_offset_t virt)
  * 
  * Expand and reorganize the current translation-table as to fit a new size.
  */
+/* All translation-table pages belong to pm_obj, including contiguous L1 runs.
+ * Release only after the hardware has stopped walking the old table. */
+static void pmap_release_l1(pmap_t map, uint32_t base, vm_size_t size)
+{
+    vm_size_t offset;
+    vm_page_t page;
+
+    assert(size && !(size & PAGE_MASK) && size <= 0x4000);
+    vm_object_lock(map->pm_obj);
+    for (offset = 0; offset < size; offset += PAGE_SIZE) {
+        page = vm_page_lookup(map->pm_obj,
+            (vm_object_offset_t)(((base + offset) >> PAGE_SHIFT) -
+                                 (gPhysBase >> PAGE_SHIFT)));
+        if (page == VM_PAGE_NULL)
+            panic("pmap_release_l1: missing translation-table page");
+        VM_PAGE_FREE(page);
+    }
+    vm_object_unlock(map->pm_obj);
+    OSAddAtomic(-(SInt32)(size >> PAGE_SHIFT), &inuse_ptepages_count);
+}
+
 void pmap_expand_ttb(pmap_t map, vm_offset_t expansion_size)
 {
-    /*
-     * If the requested expansion size is less than or greater, we have nothing to do.
-     */
-    if (expansion_size <= map->pm_l1_size)
+    vm_page_t pages, page, next;
+    uint32_t base, old_base;
+    vm_size_t size, old_size;
+    kern_return_t ret;
+
+    if (expansion_size > 0x4000 || (expansion_size & PAGE_MASK))
+        panic("pmap_expand_ttb: invalid expansion size");
+    /* ARM short-descriptor tables require power-of-two base alignment. */
+    size = expansion_size <= 0x1000 ? 0x1000 :
+           expansion_size <= 0x2000 ? 0x2000 : 0x4000;
+    PMAP_LOCK(map);
+    if (size <= map->pm_l1_size) {
+        PMAP_UNLOCK(map);
         return;
-
-    /*
-     * Do not expand past maximum size.
-     */
-    if (expansion_size > 0x4000)
-        panic("pmap_expand_ttb: attempting to expand past maximum address of %x, map %p, expansion %x\n", 0x4000, map, expansion_size);
-
-    switch (expansion_size) {
-    case 0x1000:
-        panic("pmap_expand_ttb: attempting to expand an already-expanded pmap?");
-    case 0x2000 ... 0x3000:{
-            kern_return_t ret;
-            vm_page_t pages;
-
-            /*
-             * Allocate a contiguous segment of memory for the new L1 mapping table. (including one guard)
-             */
-            ret = cpm_allocate(expansion_size, &pages, 0, ((expansion_size / map->pm_l1_size) - 1), FALSE, KMA_LOMEM);
-            assert(ret == KERN_SUCCESS);
-
-            /*
-             * We got the new contiguous block.
-             */
-            bzero((void *)phys_to_virt(pages->phys_page << PAGE_SHIFT), expansion_size);
-
-            /*
-             * Copy the old entries to the new area.
-             */
-            bcopy((void *) map->pm_l1_virt, (void *) phys_to_virt(pages->phys_page << PAGE_SHIFT), map->pm_l1_size);
-#if 1
-            kprintf("pmap_expand_ttb: 0x%x => 0x%x\n", map->pm_l1_virt, phys_to_virt(pages->phys_page << PAGE_SHIFT));
-#endif
-
-            /*
-             * Deallocate the old L1.
-             */
-            pmap_deallocate_l1(map);
-
-            /*
-             * Set the new TTB base.
-             */
-            map->pm_l1_virt = phys_to_virt(pages->phys_page << PAGE_SHIFT);
-            map->pm_l1_phys = pages->phys_page << PAGE_SHIFT;
-            map->pm_l1_size = expansion_size;
-
-            OSAddAtomic((expansion_size >> PAGE_SHIFT), &inuse_ptepages_count);
-            OSAddAtomic((expansion_size >> PAGE_SHIFT), &alloc_ptepages_count);
-
-            /*
-             * Switch into the new TTB if it needs to be used.
-             */
-            if (map == current_cpu_datap()->user_pmap) {
-                arm_context_switch(map->pm_l1_phys);
-            }
-
-            return;
-        }
-    default:
-        panic("pmap_expand_ttb: invalid expansion size %x\n", expansion_size);
     }
+    PMAP_UNLOCK(map);
 
-    return;
+    /* CPM can reclaim memory and sleep; never hold the pmap spin lock here. */
+    ret = cpm_allocate(size, &pages, 0, (size >> PAGE_SHIFT) - 1,
+                       FALSE, KMA_LOMEM);
+    if (ret != KERN_SUCCESS)
+        panic("pmap_expand_ttb: contiguous allocation failed");
+    base = pages->phys_page << PAGE_SHIFT;
+    bzero((void *)phys_to_virt(base), size);
+    vm_object_lock(map->pm_obj);
+    for (page = pages; page != VM_PAGE_NULL; page = next) {
+        next = NEXT_PAGE(page);
+        *NEXT_PAGE_PTR(page) = VM_PAGE_NULL;
+        vm_page_insert(page, map->pm_obj,
+            (vm_object_offset_t)(page->phys_page - (gPhysBase >> PAGE_SHIFT)));
+        vm_page_lockspin_queues();
+        vm_page_wire(page);
+        vm_page_unlock_queues();
+        pmap_set_noencrypt(page->phys_page);
+    }
+    vm_object_unlock(map->pm_obj);
+    OSAddAtomic(size >> PAGE_SHIFT, &inuse_ptepages_count);
+    OSAddAtomic(size >> PAGE_SHIFT, &alloc_ptepages_count);
+
+    PMAP_LOCK(map);
+    /* Another expansion may have completed while CPM was allocating. */
+    if (size <= map->pm_l1_size) {
+        PMAP_UNLOCK(map);
+        pmap_release_l1(map, base, size);
+        return;
+    }
+    old_base = map->pm_l1_phys;
+    old_size = map->pm_l1_size;
+    bcopy((void *)map->pm_l1_virt, (void *)phys_to_virt(base), old_size);
+    FLUSH_PTE_RANGE((pt_entry_t *)phys_to_virt(base),
+                     (pt_entry_t *)phys_to_virt(base) + size / sizeof(pt_entry_t));
+    arm_drain_writebuf();
+    map->pm_l1_virt = phys_to_virt(base);
+    map->pm_l1_phys = base;
+    map->pm_l1_size = size;
+    if (map == current_cpu_datap()->user_pmap)
+        pmap_switch_user_ttb(map);
+    PMAP_UNLOCK(map);
+    pmap_release_l1(map, old_base, old_size);
 }
 
 /**
@@ -3446,63 +3504,36 @@ void pmap_expand_ttb(pmap_t map, vm_offset_t expansion_size)
  */
 void pmap_expand(pmap_t map, vm_offset_t v)
 {
-    vm_offset_t *tte = (vm_offset_t *) pmap_tte(map, v);
-    vm_page_t page = pmap_grab_page(map);
-    spl_t spl;
-
-    /*
-     * High priority. We do not want any interruptions.
-     */
-    PMAP_LOCK(map);
+    vm_offset_t *tte;
+    vm_page_t page;
 
     if (map != kernel_pmap) {
-        /*
-         * First, if we have a size below 0x1000, we can't be sure about expanding. 
-         */
-        if (map->pm_l1_size < 0x1000) {
-            panic("pmap_expand: this pmap has a really weird size: %d bytes", map->pm_l1_size);
-        }
-
-        /*
-         * See if we can make it grow.
-         */
-        uint32_t expansion_size = ((tte_offset(v)) & ~(PAGE_SIZE - 1)) + PAGE_SIZE;
-        pmap_expand_ttb(map, expansion_size);
-
-        /*
-         * Refetch the TTE, since the pmap base may have changed.
-         */
-        tte = (vm_offset_t *) pmap_tte(map, v);
-
-#if 0
-        /*
-         * Do not extend past the commpage. 
-         */
-        if (map->pm_l1_size == 0x1000) {
-            if (v >= _COMM_PAGE_BASE_ADDRESS) {
-                panic("attempting to expand pmap past maximum address of %x\n", _COMM_PAGE_BASE_ADDRESS);
-            }
-        }
-#endif
-
-        /*
-         * L1 section mappings may not be expanded any further.
-         */
-        if ((*tte & ARM_PAGE_MASK_VALUE) == ARM_PAGE_SECTION)
-            panic("cannot expand current map into L1 sections");
+        uint32_t size = (tte_offset(v) & ~(PAGE_SIZE - 1)) + PAGE_SIZE;
+        pmap_expand_ttb(map, size);
     }
-
-    /*
-     * Overwrite the old L1 mapping in this region with a fresh L1 descriptor.
-     */
+    page = pmap_grab_page(map);
+    PMAP_LOCK(map);
+    tte = (vm_offset_t *)pmap_tte(map, v);
+    if (!tte)
+        panic("pmap_expand: missing L1 table");
+    if ((*tte & ARM_PAGE_MASK_VALUE) == ARM_PAGE_SECTION)
+        panic("pmap_expand: cannot expand an L1 section");
+    if ((*tte & ARM_PAGE_MASK_VALUE) == L1_TYPE_PTE) {
+        /* A competing fault already installed this table. */
+        PMAP_UNLOCK(map);
+        vm_object_lock(map->pm_obj);
+        VM_PAGE_FREE(page);
+        vm_object_unlock(map->pm_obj);
+        OSAddAtomic(-1, &inuse_ptepages_count);
+        return;
+    }
+    FLUSH_PTE_RANGE((pt_entry_t *)phys_to_virt(page->phys_page << PAGE_SHIFT),
+                     (pt_entry_t *)phys_to_virt(page->phys_page << PAGE_SHIFT) + PAGE_SIZE / sizeof(pt_entry_t));
     *tte = ((page->phys_page << PAGE_SHIFT) & L1_PTE_ADDR_MASK) | L1_TYPE_PTE;
-
-    /*
-     * Flush the TLBs since we updated the page tables.
-     */
+    FLUSH_PTE(tte);
+    arm_drain_writebuf();
     pmap_flush_tlbs(map, v, v + PAGE_SIZE);
     PMAP_UNLOCK(map);
-    return;
 }
 
 /**
@@ -3517,6 +3548,11 @@ static uint32_t pmap_enter_refmod(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, v
                                  vm_prot_t fault_type, boolean_t wired,
                                  uint32_t pte)
 {
+    /* Pager writes arrive through a different VA from the executable mapping.
+     * Publish the data and discard old instructions before granting execution,
+     * including when an existing PTE is re-entered after a page fault. */
+    if (prot & VM_PROT_EXECUTE)
+        pmap_sync_page_data_phys(pa);
 #if !BOARD_CONFIG_QSD8250_LEO
     pv_rooted_entry_t entry;
 #endif
@@ -3528,7 +3564,7 @@ static uint32_t pmap_enter_refmod(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, v
 #if !BOARD_CONFIG_QSD8250_LEO
         entry = pmap_find_pv(pmap, pa, va);
         if (!entry)
-            panic("pmap_enter_refmod: missing PV entry");
+            panic("pmap_enter_refmod: missing PV entry pmap=%p va=%x pa=%x managed=%d", pmap, va, pa, pmap_valid_page(pa));
         entry->fault_access = (entry->fault_access & PMAP_MAPPING_WIRED) |
                               (pte & (PMAP_ACCESS_MASK | L2_NX_BIT));
         pmap_mapping_wire(entry, wired);
@@ -3575,7 +3611,7 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
     /*
      * Only low addresses are supported for user pmaps.
      */
-    if (va > _COMM_PAGE_BASE_ADDRESS && pmap != kernel_pmap) {
+    if (va >= VM_MAX_ADDRESS && pmap != kernel_pmap) {
         kprintf("pmap_enter_options: low address 0x%08X is invalid for pmap %p\n", va, pmap);
         return KERN_INVALID_ARGUMENT;
     }
@@ -3634,8 +3670,16 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
         uint32_t template_pte = ((pa << PAGE_SHIFT) & L2_ADDR_MASK) | L2_SMALL_PAGE;
         template_pte |= pmap_vm_prot_to_page_flags(pmap, prot, wired, 0);
 
-        if (va == _COMM_PAGE_BASE_ADDRESS)
+        if (va == _COMM_PAGE_BASE_ADDRESS
+            || va == _COMM_PAGE_IOS6_BASE_ADDRESS
+            || va == _COMM_PAGE_IOS7_BASE_ADDRESS
+            ) {
             template_pte |= L2_ACCESS_USER;
+#if !BOARD_CONFIG_ARMPBA8 && !BOARD_CONFIG_QSD8250_LEO
+            if (pmap == kernel_pmap)
+                template_pte &= ~L2_ACCESS_PRW;
+#endif
+        }
 #if BOARD_CONFIG_ARMPBA8 || BOARD_CONFIG_QSD8250_LEO
         if (pmap == kernel_pmap && va == IOS7LAB_COMMPAGE_ALIAS)
             template_pte |= L2_ACCESS_USER | L2_ACCESS_APX | L2_NX_BIT;
@@ -3644,10 +3688,20 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
         /*
          * Add cacheability attributes.
          */
-        template_pte |= pmap_get_cache_attributes(pa);
+        template_pte |= pmap_enter_cache_attributes(pa, flags);
 
         template_pte = pmap_enter_refmod(pmap, va, pa, prot, fault_type, wired, template_pte);
+        if ((old_pte ^ template_pte) & ~cacheability_mask) {
+            /* Clean dirty data before retiring the old memory type, then
+             * invalidate the descriptor before publishing its replacement. */
+            arm_dcache_wbinv_all();
+            *(uint32_t *)pte = 0;
+            FLUSH_PTE((pt_entry_t *)pte);
+            arm_drain_writebuf();
+            pmap_flush_tlbs(pmap, va, va + PAGE_SIZE);
+        }
         *(uint32_t *) pte = template_pte;
+        FLUSH_PTE((pt_entry_t *)pte);
 
         /*
          * The work here is done, the PTE will now have new permissions. Flush the TLBs for the
@@ -3672,6 +3726,7 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
         if (old_pte & ARM_PTE_DESCRIPTOR_4K) {
             pai = pa_index(old_pte & L2_ADDR_MASK);
             *(uint32_t *)pte = 0;
+            FLUSH_PTE((pt_entry_t *)pte);
 
             pv_rooted_entry_t old_entry = pmap_find_pv(pmap, pai, va);
             /* Only the kernel may have raw bootstrap I/O mappings. */
@@ -3834,8 +3889,16 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
     /*
      * Hack for commpage, how is this to be done?
      */
-    if (va == _COMM_PAGE_BASE_ADDRESS)
+    if (va == _COMM_PAGE_BASE_ADDRESS
+        || va == _COMM_PAGE_IOS6_BASE_ADDRESS
+        || va == _COMM_PAGE_IOS7_BASE_ADDRESS
+        ) {
         template_pte |= L2_ACCESS_USER;
+#if !BOARD_CONFIG_ARMPBA8 && !BOARD_CONFIG_QSD8250_LEO
+        if (pmap == kernel_pmap)
+            template_pte &= ~L2_ACCESS_PRW;
+#endif
+    }
 #if BOARD_CONFIG_ARMPBA8 || BOARD_CONFIG_QSD8250_LEO
     if (pmap == kernel_pmap && va == IOS7LAB_COMMPAGE_ALIAS)
         template_pte |= L2_ACCESS_USER | L2_ACCESS_APX | L2_NX_BIT;
@@ -3844,10 +3907,11 @@ kern_return_t pmap_enter_options(pmap_t pmap, vm_map_offset_t va, ppnum_t pa, vm
     /*
      * Add cacheability attributes.
      */
-    template_pte |= pmap_get_cache_attributes(pa);
+    template_pte |= pmap_enter_cache_attributes(pa, flags);
 
     template_pte = pmap_enter_refmod(pmap, va, pa, prot, fault_type, wired, template_pte);
     *(uint32_t *) pte = template_pte;
+    FLUSH_PTE((pt_entry_t *)pte);
 
     /* 
      * Unlock the pv. (if it is managed by us)
@@ -3994,8 +4058,10 @@ void pmap_init(void)
          */
         for (kva = vm_kernel_stext; kva < vm_kernel_etext; kva += PAGE_SIZE) {
             ptep = (pt_entry_t *)pmap_pte(kernel_pmap, (vm_map_offset_t) kva);
-            if (ptep)
+            if (ptep) {
                 *ptep |= L2_ACCESS_APX;
+                FLUSH_PTE(ptep);
+            }
         }
     }
 
@@ -4045,6 +4111,7 @@ void pmap_init(void)
             dpte |= L2_ACCESS_APX;
         }
         *pte = dpte;
+        FLUSH_PTE(pte);
     }
 
     /*
@@ -4125,6 +4192,7 @@ void pmap_remove_range(pmap_t pmap, vm_map_offset_t start_vaddr, pt_entry_t * sp
             if (state & PMAP_BOOT_WIRED)
                 num_unwired++;
             *cpte = 0;
+            FLUSH_PTE(cpte);
             continue;
         }
 
@@ -4150,6 +4218,7 @@ void pmap_remove_range(pmap_t pmap, vm_map_offset_t start_vaddr, pt_entry_t * sp
                 panic("pmap_remove_range: unmanaged user PV entry missing");
             }
             *cpte = 0;
+            FLUSH_PTE(cpte);
             continue;
         }
 
@@ -4170,6 +4239,7 @@ void pmap_remove_range(pmap_t pmap, vm_map_offset_t start_vaddr, pt_entry_t * sp
          * Nuke the page table entry.
          */
         *cpte = 0;
+        FLUSH_PTE(cpte);
 
         /*
          * Continue onwards if pmap isn't up yet.. (keep nuking pages!)
@@ -4259,7 +4329,6 @@ void pmap_remove(pmap_t map, vm_offset_t sva, vm_offset_t eva)
         if (lva <= sva || lva > eva)
             lva = eva;
         tte = (pt_entry_t *)pmap_tte(map, sva);
-        assert(tte);
         if (tte && ((*tte & ARM_PAGE_MASK_VALUE) == ARM_PAGE_PAGE_TABLE)) {
             pt_entry_t *spte_begin;
             spte_begin = (pt_entry_t *) (phys_to_virt(L1_PTE_ADDR(*tte)));
@@ -4441,6 +4510,7 @@ void pmap_page_protect(ppnum_t pn, vm_prot_t prot)
                 pmap_mapping_wire(pv_e,FALSE);
 #endif
                 *(pt_entry_t *) pte = 0;
+                FLUSH_PTE((pt_entry_t *)pte);
                 pmap_flush_tlbs(pmap, vaddr, vaddr + PAGE_SIZE);
                 /* Reference/modify history belongs to the physical page,
                  * not this mapping. pmap_disconnect reads it after removal;
@@ -4479,10 +4549,19 @@ void pmap_page_protect(ppnum_t pn, vm_prot_t prot)
                 /*
                  * Write-protect.
                  */
-                *(pt_entry_t *) pte |= (L2_ACCESS_APX);
+                pt_entry_t updated = *pte | L2_ACCESS_APX;
+                if (nx_enabled && pmap->pm_nx && !(prot & VM_PROT_EXECUTE))
+                    updated |= L2_NX_BIT;
+                /* This lowering operation retains an existing XN bit even
+                 * for READ|EXECUTE; only a later VM enter may grant access. */
+                *pte = updated;
+                FLUSH_PTE((pt_entry_t *)pte);
 #if !BOARD_CONFIG_QSD8250_LEO
                 pv_e->fault_access |= L2_ACCESS_APX;
                 pv_e->fault_access &= ~PMAP_FAULT_MOD;
+                /* Fast ref/mod faults must retain the new execute policy. */
+                pv_e->fault_access = (pv_e->fault_access & ~L2_NX_BIT) |
+                                     (*pte & L2_NX_BIT);
 #endif
                 arm_drain_writebuf();
                 pmap_flush_tlbs(pmap, vaddr, vaddr + PAGE_SIZE);
@@ -4535,49 +4614,7 @@ void pmap_page_protect(ppnum_t pn, vm_prot_t prot)
  */
 void pmap_deallocate_l1(pmap_t pmap)
 {
-    uint32_t ttb_base = pmap->pm_l1_phys;
-    vm_page_t m;
-
-    /*
-     * If the pmap is expanded past 0x1000, we must use cpm_deallocate.
-     */
-    if (pmap->pm_l1_size > 0x1000) {
-        /*
-         * xxx todo 
-         */
-        return;
-    }
-
-    /*
-     * Lock the VM object. 
-     */
-    vm_object_lock(pmap->pm_obj);
-
-    /*
-     * Look up the page.
-     */
-    m = vm_page_lookup(pmap->pm_obj, (vm_object_offset_t) ((ttb_base >> PAGE_SHIFT) - (gPhysBase >> PAGE_SHIFT)));
-    assert(m);
-
-    /*
-     * Got it, now free it.
-     */
-    VM_PAGE_FREE(m);
-
-    /*
-     * Done.
-     */
-    vm_object_unlock(pmap->pm_obj);
-
-    /*
-     * Remove one.
-     */
-    OSAddAtomic(-1, &inuse_ptepages_count);
-
-    /*
-     * Invalidation of the entire pmap should be done.
-     */
-    return;
+    pmap_release_l1(pmap, pmap->pm_l1_phys, pmap->pm_l1_size);
 }
 
 /**
@@ -4707,7 +4744,6 @@ void pmap_protect(pmap_t map, vm_map_offset_t sva, vm_map_offset_t eva, vm_prot_
         if (lva <= sva || lva > eva)
             lva = eva;
         tte = (pt_entry_t *)pmap_tte(map, sva);
-        assert(tte);
         if (tte && ((*tte & ARM_PAGE_MASK_VALUE) == ARM_PAGE_PAGE_TABLE)) {
             pt_entry_t *spte_begin;
             spte_begin = (pt_entry_t *) (phys_to_virt(L1_PTE_ADDR(*tte)));
@@ -4745,17 +4781,14 @@ void pmap_protect(pmap_t map, vm_map_offset_t sva, vm_map_offset_t eva, vm_prot_
                      */
                     if (set_NX) {
                         template_pte |= L2_NX_BIT;
-                    } else {
-                        /* iOS 7 ARM synchronizes the physical page before
-                         * publishing an NX-to-executable permission change. */
-                        if (*spte & L2_NX_BIT)
-                            invalidate_icache(*spte & L2_ADDR_MASK, PAGE_SIZE, TRUE);
-                        template_pte &= ~L2_NX_BIT;
                     }
+                    /* Permission lowering never grants execution; VM must
+                     * re-enter the mapping to clear an existing XN bit. */
 #if !BOARD_CONFIG_QSD8250_LEO
                     pmap_fault_protect(map, vaddr, template_pte);
 #endif
                     *spte = template_pte;
+                    FLUSH_PTE(spte);
                 }
                 spte++;
                 vaddr += PAGE_SIZE;
@@ -4986,9 +5019,12 @@ void pmap_copy_part_lpage(vm_offset_t src, vm_offset_t dst, vm_offset_t dst_offs
  * Copy part of a physically addressed page 
  * to a virtually addressed page.
  */
-void pmap_copy_part_rpage(vm_offset_t src, vm_offset_t src_offset, vm_offset_t dst, vm_size_t len)
+void pmap_copy_part_rpage(ppnum_t src, vm_offset_t src_offset, vm_offset_t dst, vm_size_t len)
 {
-    panic("pmap_copy_part_rpage");
+    assert(src != vm_page_fictitious_addr);
+    assert(src_offset <= PAGE_SIZE && len <= PAGE_SIZE - src_offset);
+    ovbcopy((void *)(phys_to_virt(src << PAGE_SHIFT) + src_offset),
+            (void *)dst, len);
 }
 
 /**

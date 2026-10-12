@@ -58,7 +58,9 @@ EnterARM(invalidate_dcache_region)
  */
 EnterARM(dcache_incoherent_io_store64)
     mov     r1, r2
+    push    {r4, lr}
     GetPhysAddr(r0)
+    pop     {r4, lr}
 
 /**
  * clean_dcache_region
@@ -83,7 +85,9 @@ EnterARM(cleanflush_dcache)
  */
 EnterARM(dcache_incoherent_io_flush64)
     mov     r1, r2
+    push    {r4, lr}
     GetPhysAddr(r0)
+    pop     {r4, lr}
 
 /**
  * cleanflush_dcache_region
@@ -110,7 +114,9 @@ EnterARM(flush_dcache64)
 EnterARM_NoAlign(flush_dcache)
     cmp     r2, #0
     beq _cleanflush_dcache_region
+    push    {r4, lr}
     GetPhysAddr(r0)
+    pop     {r4, lr}
     b _cleanflush_dcache_region
 
 /**
@@ -130,7 +136,9 @@ EnterARM(invalidate_icache64)
 EnterARM_NoAlign(invalidate_icache)
     cmp     r2, #0
     beq _invalidate_icache_region
+    push    {r4, lr}
     GetPhysAddr(r0)
+    pop     {r4, lr}
     b _invalidate_icache_region
 
 /**
@@ -164,13 +172,22 @@ EnterARM(invalidate_branch_target_cache)
  * This should be called before switching translation table bases.
  */
 EnterARM(flush_mmu_tlb)
+#ifdef _ARM_ARCH_7
+    /* Publish descriptors before invalidating translations. Completion
+     * must precede the instruction synchronization (Apple flush_mmu_tlb). */
+    dsb     sy
+    mov     r0, #0
+#ifdef MULTIPROCESSOR
+    mcr     p15, 0, r0, c8, c3, 0
+#else
+    mcr     p15, 0, r0, c8, c7, 0
+#endif
+    dsb     sy
+    isb     sy
+#else
     mov     r0, #0
     mcr     p15, 0, r0, c8, c7, 0
     mcr     p15, 0, r0, c7, c5, 0
-#ifdef _ARM_ARCH_7
-    isb     sy
-    dsb     sy
-#else
     mcr     p15, 0, r0, c7, c5, 4
     mcr     p15, 0, r0, c7, c10, 4
 #endif

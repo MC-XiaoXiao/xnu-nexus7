@@ -31,6 +31,7 @@
  */
 
 #include <arm/arch.h>
+#include <config_dtrace.h>
 #include <arm/asm_help.h>
 #include <assym.s>
 #include <mach/arm/asm.h>
@@ -102,10 +103,20 @@ undef_from_kernel:
     add     r3, sp, #0x50
     str     r3, [r0, #0x34]
 
+#if CONFIG_DTRACE
+    /* The 0x50-byte allocation contains a 0x44-byte saved state followed
+     * by a frame record. FBT may replace its backchain before emulation. */
+    str     r7, [sp, #0x44]
+    ldr     r1, [sp, #0x38]
+    str     r1, [sp, #0x48]
+    add     r7, sp, #0x44
+#endif
     blx     _sleh_undef
 
-    /* NEVER COME BACK */
-    b       .
+    /* A handled probe can change SP, LR, PC and CPSR (POP/BX). Restore
+     * through the existing exception-return path, not a normal BX LR. */
+    mov     r5, sp
+    b       restart_kernel_execution
 
 /**
  * fleh_swi
@@ -113,10 +124,6 @@ undef_from_kernel:
  * Call the software interrupt handler.
  */
 EnterARM(fleh_swi)
-#if !(BOARD_CONFIG_ARMPBA8 || BOARD_CONFIG_QSD8250_LEO)
-    cmn     r12, #3
-    beq     swi_trap_tb
-#endif
 
     /* Save current registers and spsr */
     LoadThreadRegister(sp)
@@ -159,13 +166,11 @@ leo_frontier_entry_skip:
     ldmfd   sp!, {r0,r1}
 leo_frontier_entry_done:
 #endif
-#if BOARD_CONFIG_ARMPBA8 || BOARD_CONFIG_QSD8250_LEO
-    /* Original iOS ARMv7's -3 fallback returns the actual 64-bit clock.
+    /* Apple's ARM32 -3 timebase trap returns the actual 64-bit clock.
      * Use the normal saved-state/kernel-stack path and restore through
      * swi_exit64, preserving both r0 and r1. */
     cmn     r11, #3
-    beq     ios7lab_timebase
-#endif
+    beq     swi_timebase
     /* Is it a trap? */
     cmp     r11, #0x80000000
     beq     swi_trap
@@ -179,7 +184,7 @@ swi_mach:
     adr     lr, swi_exit
     mov     r4, r5
     cmp     r5, #0x80
-    bge     swi_mach_error
+    bhs     swi_mach_error
     LOAD_ADDR(r1, mach_trap_table)
 
     add     r11, r5, r5, lsl#1
@@ -230,11 +235,19 @@ leo_frontier_return_done:
     b       irqvec_panic
 
 swi_mach_error:
-    /* There was an error processing the Mach system call, panic. */
+    /* Apple ARM iOS6/iOS7 delivers EXC_SYSCALL with one code. This tree's
+     * triage takes 64-bit codes; its legacy conversion reads both slots
+     * even for codeCnt == 1, so also initialize the unused second slot. */
+    sub     sp, sp, #16
+    str     r4, [sp]
+    mov     r3, #0
+    str     r3, [sp, #4]
+    str     r3, [sp, #8]
+    str     r3, [sp, #12]
     mov     r0, #7
-    mov     r1, r4
+    mov     r1, sp
     mov     r2, #1
-    blx     _doexception
+    blx     _exception_triage
 
     mov     r0, #0x81
     b       irqvec_panic
@@ -257,23 +270,59 @@ swi_trap_table:
     b       thread_set_cthread_trap
     b       thread_get_cthread_trap
 
-swi_trap_tb:
-    /* Fast return */
-    movs    pc, lr
-
-#if BOARD_CONFIG_ARMPBA8 || BOARD_CONFIG_QSD8250_LEO
-ios7lab_timebase:
+swi_timebase:
     blx     _mach_absolute_time
     b       swi_exit64
-#endif
 
 icache_inv_trap:
-    bl      _arm_icache_inv_all
-    bl      _thread_exception_return
+    mov     r2, #0
+    b       cache_range_trap
 
 dcache_inv_trap:
-    bl      _arm_dcache_inv_all
-    bl      _thread_exception_return
+    mov     r2, #1
+
+cache_range_trap:
+    /* Apple cache traps operate on the supplied user interval, with a
+     * recover point for maintenance faults. Never discard dirty caches. */
+    cmp     r1, #0
+    beq     cache_range_return
+    adds    r12, r0, r1
+    bcs     cache_range_invalid
+    cmp     r12, VM_MAX_ADDRESS
+    bhi     cache_range_invalid
+    stmfd   sp!, {r4-r6,lr}
+    LoadThreadRegister(r4)
+    ldr     r5, [r4, TH_RECOVER]
+    mov     r6, sp
+    adr     r12, cache_range_fault
+    str     r12, [r4, TH_RECOVER]
+    cmp     r2, #0
+    bne     cache_range_dcache
+    bl      _arm_icache_sync_range
+    b       cache_range_done
+cache_range_dcache:
+    bl      _arm_dcache_wbinv_range
+cache_range_done:
+    /* The range primitives preserve r4-r6, including on a data abort. */
+    mov     sp, r6
+    str     r5, [r4, TH_RECOVER]
+    ldmfd   sp!, {r4-r6,lr}
+cache_range_return:
+    b       _thread_exception_return
+
+cache_range_fault:
+    /* Report the actual maintenance fault after restoring outer recovery. */
+    mrc     p15, 0, r0, c6, c0, 0
+    mov     sp, r6
+    str     r5, [r4, TH_RECOVER]
+    ldmfd   sp!, {r4-r6,lr}
+    b       _arm_cache_exception
+cache_range_invalid:
+    /* The first invalid byte is the user limit, unless the start already
+     * lies outside it. Do not report a wrapped end as a valid user address. */
+    cmp     r0, VM_MAX_ADDRESS
+    movlo   r0, VM_MAX_ADDRESS
+    b       _arm_cache_exception
 
 thread_set_cthread_trap:
     /* Set the current cthread value. */
@@ -499,12 +548,18 @@ irqhandler_from_user:
     mrs     r0, spsr
     str     r0, [sp, #0x40]
     mov     r5, sp
-    LOAD_ADDR(sp, irqstack_top)
+    LoadThreadRegister(sp)
+    ldr     sp, [sp, MACHINE_THREAD_CPU_DATA]
+    ldr     sp, [sp, CPU_INT_STACK_TOP]
+
     b       irq_join
 
 irqhandler_from_kernel:
     /* Set up IRQ stack */
-    LOAD_ADDR(sp, irqstack_top)
+    LoadThreadRegister(sp)
+    ldr     sp, [sp, MACHINE_THREAD_CPU_DATA]
+    ldr     sp, [sp, CPU_INT_STACK_TOP]
+
 
     /* Now save the registers */
     sub     sp, sp, #0x50
@@ -552,9 +607,7 @@ irq_restore_kernel:
     ldr     r0, [r12, MACHINE_THREAD_PREEMPT_COUNT]
 
     /* Preempt thread if necessary */
-#if defined(BOARD_CONFIG_QSD8250_LEO)
     cmp     r0, #0
-#endif
     bne     restore_kernel_context
 
 irq_preempt:
@@ -615,6 +668,13 @@ return_to_kernel:
     cmp     r0, #0
     bne     restart_kernel_execution
 
+    /* Kernel returns honor only urgent preemption. Leave deferred ASTs
+     * pending for the normal scheduling or user-return path. */
+    ldr     r0, [r12, MACHINE_THREAD_CPU_DATA]
+    ldr     r0, [r0, CPU_PENDING_AST]
+    tst     r0, #4                  /* AST_URGENT */
+    beq     restart_kernel_execution
+
 preempt_kernel:
     mov     r0, #7
     mov     r1, #0
@@ -634,6 +694,10 @@ restart_kernel_execution:
 
     /* The following routine should also be shared with data abort. */
 restore_kernel_context:
+#ifdef _ARM_ARCH_7
+    /* Exception handlers may leave an exclusive reservation behind. */
+    clrex
+#endif
     ldmfd   sp, {r0-r12}
     add     sp, sp, #0x3C
     rfefd   sp!
@@ -643,7 +707,10 @@ restore_kernel_context:
  * vector panic helper.
  */
 irqvec_panic:
-    LOAD_ADDR(sp, irqstack_top)
+    LoadThreadRegister(sp)
+    ldr     sp, [sp, MACHINE_THREAD_CPU_DATA]
+    ldr     sp, [sp, CPU_INT_STACK_TOP]
+
     mov     r1, r0
     adr     r0, vecPanicString
     blx     _panic

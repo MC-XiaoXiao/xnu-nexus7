@@ -108,7 +108,7 @@ void machine_set_current_thread(thread_t thread)
     /*
      * Set the current thread.
      */
-    CurrentThread = thread;
+    thread->machine.cpu_data = current_cpu_datap();
 
     arm_set_threadpid_user_readonly((uint32_t *) thread->machine.cthread_self);
     arm_set_threadpid_priv_readwrite((uint32_t *) thread);
@@ -203,6 +203,7 @@ thread_t machine_switch_context(thread_t old, thread_continue_t continuation,
 
     datap->old_thread = old;
     datap->new_thread = new;
+    new->machine.cpu_data = datap;
 
     save_vfp_context(old);
 

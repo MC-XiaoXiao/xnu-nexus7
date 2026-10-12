@@ -45,6 +45,11 @@
  */
 EnterARM(hw_compare_and_store)
 EnterARM(OSCompareAndSwap)
+#ifdef _ARM_ARCH_7
+    dmb     ishst
+#else
+    mcr     p15, 0, r3, c7, c10, 5
+#endif
     mov     r12, r0
 loop:
     ldrex   r3, [r2]
@@ -53,8 +58,13 @@ loop:
     bxne    lr
     strex   r0, r1, [r2]
     eors    r0, r0, #1
-    bxne    lr
-    b       loop
+    beq     loop
+#ifdef _ARM_ARCH_7
+    dmb     ish
+#else
+    mcr     p15, 0, r3, c7, c10, 5
+#endif
+    bx      lr
 
 /*
  * Atomic functions

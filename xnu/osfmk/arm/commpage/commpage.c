@@ -40,9 +40,7 @@
 #include <vm/vm_map.h>
 #include <vm/vm_kern.h>
 #include <machine/cpu_capabilities.h>
-#if BOARD_CONFIG_QSD8250_LEO
 #include <machine/machine_routines.h>
-#endif
 
 void *common_page_ptr = NULL;
 decl_simple_lock_data(static,commpage_active_cpus_lock)
@@ -54,18 +52,14 @@ void commpage_update_active_cpus(void)
 
     /* Lock the lock and update the global page value */
     simple_lock(&commpage_active_cpus_lock);
-#if BOARD_CONFIG_ARMPBA8 || BOARD_CONFIG_QSD8250_LEO
-    /* Original iOS7 libdispatch sizes its heap from LOGICAL_CPUS at +0x36.
-     * This reference machine runs exactly one present/active physical CPU. */
-    assert(processor_avail_count == 1);
+    assert(processor_avail_count > 0 && processor_avail_count <= UINT8_MAX);
     *(uint8_t*)_COMM_PAGE_NCPUS = (uint8_t)processor_avail_count;
     *(uint8_t*)(_COMM_PAGE_BASE_ADDRESS + 0x34) = (uint8_t)processor_avail_count;
+
+
+    /* This ARM port has no SMT: physical and logical online counts match. */
     *(uint8_t*)(_COMM_PAGE_BASE_ADDRESS + 0x35) = (uint8_t)processor_avail_count;
     *(uint8_t*)(_COMM_PAGE_BASE_ADDRESS + 0x36) = (uint8_t)processor_avail_count;
-#else
-    *(uint32_t*)_COMM_PAGE_NCPUS = processor_avail_count;
-#endif
-
     /* Done. */
     simple_unlock(&commpage_active_cpus_lock);
 }
@@ -90,7 +84,7 @@ void commpage_populate(void)
     *(uint32_t*)_COMM_PAGE_CPUFAMILY = CPUFAMILY_ARM_13;     /* Cortex-A8 */
 #endif
     *(uint16_t*)_COMM_PAGE_MYSTERY_VALUE = 3;                /* It's a mystery! */
-    *(uint32_t*)_COMM_PAGE_CPU_CAPABILITIES = kUP;           /* No capabilities, UP system. */
+    *(uint32_t*)_COMM_PAGE_CPU_CAPABILITIES = (ml_get_max_cpus() == 1 ? kUP : 0) | (ml_get_max_cpus() << 16);           /* No capabilities, UP system. */
     *(uint64_t*)_COMM_PAGE_MEMORY_SIZE = ram_size;           /* Set our ram size */
 
     /* Update CPU count */

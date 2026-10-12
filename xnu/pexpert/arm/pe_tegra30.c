@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-2-Clause
  * Minimal Tegra30 / Nexus 7 (2012) platform expert.
  * Register facts: archived tegra30.dtsi, board-grouper.c and Tegra timer docs.
- * Boot CPU only. The loader must initialize SDRAM, UART pinmux/clock/divisor,
+ * The loader must initialize SDRAM, UART pinmux/clock/divisor,
  * TIMERUS_USEC_CFG (1 MHz), disable secondary CPUs, and provide XNU boot_args.
  */
 #if defined(BOARD_CONFIG_TEGRA30_NEXUS7)
@@ -12,6 +12,7 @@
 #include <pexpert/device_tree.h>
 #include <machine/machine_routines.h>
 #include <arm/pmap.h>
+#include <libkern/OSAtomic.h>
 #include <kern/debug.h>
 #include <IOKit/IOPlatformExpert.h>
 
@@ -24,6 +25,8 @@ static uint32_t timer_phys, gicd_phys, gicc_phys, lic_phys, uart_phys, pmc_phys;
 #define TICK_US 10000U
 #define REG(b, o) (*(volatile uint32_t *)((b) + (o)))
 static vm_offset_t uart_base, timer_base, gicd_base, gicc_base, lic_base, pmc_base;
+static vm_offset_t car_base, flow_base, evp_base, scu_base;
+static volatile UInt32 timebase_lock;
 static uint32_t last_usec;
 static uint64_t elapsed_usec;
 static boolean_t clock_ready;
@@ -146,6 +149,13 @@ static void tegra_interrupt_init(void)
     lic_base = ml_io_map(lic_phys, 0x1000);
     timer_base = ml_io_map(timer_phys, 0x1000);
     pmc_base = ml_io_map(pmc_phys & ~0xfffU, 0x1000) + (pmc_phys & 0xfffU);
+    car_base = ml_io_map(0x60006000, 0x1000);
+    flow_base = ml_io_map(0x60007000, 0x1000);
+    evp_base = ml_io_map(0x6000f000, 0x1000);
+    scu_base = ml_io_map(0x50040000, 0x1000);
+    /* locore enables the SCU before caching any kernel data. Invalidating
+     * its duplicate tags here would lose tracking of the master's lines. */
+    if (!(REG(scu_base, 0) & 1)) panic("Tegra30 SCU was not enabled at entry");
     PE_halt_restart = tegra_halt_restart;
     REG(gicd_base, 0) = 0;
     REG(gicc_base, 0) = 0;
@@ -180,19 +190,23 @@ static uint64_t tegra_timebase(void)
     uint32_t now;
     uint64_t result;
     if (!clock_ready) return 0;
-    /* UP: IRQ exclusion makes the 32-bit wrap extension and 64-bit read atomic.
-     * Requires a sample at least once every 2^32 us, including idle. */
+    /* IRQ exclusion plus a raw atomic lock protects the shared wrap extension.
+     * TIMER1 samples at least once every 2^32 us, including idle. */
     enabled = ml_set_interrupts_enabled(FALSE);
+    while (!OSCompareAndSwap(0, 1, &timebase_lock)) {}
+    __asm__ volatile("dmb ish" ::: "memory");
     now = REG(timer_base, 0x10);
     elapsed_usec += (uint32_t)(now - last_usec);
     last_usec = now;
     result = elapsed_usec;
+    __asm__ volatile("dmb ish" ::: "memory");
+    timebase_lock = 0;
     ml_set_interrupts_enabled(enabled);
     return result;
 }
 static void tegra_timer_enabled(int enabled)
 {
-    if (!timer_base) return;
+    if (!timer_base || get_cpu_number() != 0) return;
     REG(timer_base, 0) = enabled ? (0xc0000000U | (TICK_US - 1)) : 0;
     io_sync();
 }
@@ -207,6 +221,9 @@ static void tegra_timebase_init(void)
     rtc_configure(1000000);
     tegra_timer_enabled(TRUE);
 }
+extern void tegra30_dispatch_ipi(unsigned);
+extern unsigned arm_smp_timer_mask(void);
+extern void arm_smp_tick(arm_saved_state_t *);
 static void tegra_handle_interrupt(void *context)
 {
     uint32_t ack = REG(gicc_base, 0xc), irq = ack & 0x3ff;
@@ -215,6 +232,16 @@ static void tegra_handle_interrupt(void *context)
         REG(timer_base, 4) = 1U << 30;
         io_sync();
         (void)tegra_timebase();
+        arm_smp_tick((arm_saved_state_t *)context);
+        rtclock_intr((arm_saved_state_t *)context);
+        unsigned targets = arm_smp_timer_mask();
+        if (targets) REG(gicd_base, 0xf00) = (targets << 16) | 1;
+    } else if (irq == 0) {
+        unsigned physical;
+        __asm__ volatile("mrc p15, 0, %0, c0, c0, 5" : "=r"(physical));
+        tegra30_dispatch_ipi(physical & 3);
+    } else if (irq == 1) {
+        arm_smp_tick((arm_saved_state_t *)context);
         rtclock_intr((arm_saved_state_t *)context);
     } else {
         /* No other device driver is installed yet; prevent an IRQ storm. */
@@ -236,6 +263,65 @@ static void tegra_framebuffer_init(void)
     }
     initialize_screen(&PE_state.video, kPETextMode);
 }
+/* GIC SGI0 carries scheduler ASTs; SGI1 supplies periodic slave timer ticks.
+ * Full TLB invalidations use the Cortex-A9 inner-shareable hardware path. */
+void tegra30_signal_cpu(unsigned physical)
+{
+    io_sync();
+    REG(gicd_base, 0xf00) = (1U << (16 + physical));
+    io_sync();
+}
+void tegra30_init_cpu(void)
+{
+    REG(gicc_base, 0) = 0;
+    REG(gicd_base, 0x180) = 0xffff0000U;
+    REG(gicd_base, 0x280) = 0xffffffffU;
+    REG(gicd_base, 0x400) = 0x80808080U;
+    REG(gicd_base, 0x100) = 3;
+    REG(gicc_base, 4) = 0xff;
+    REG(gicc_base, 8) = 0;
+    REG(gicc_base, 0) = 1;
+    io_sync();
+}
+kern_return_t tegra30_start_cpu(unsigned cpu, vm_offset_t entry)
+{
+    unsigned domain = cpu + 8;
+    uint32_t reset = 0x1111U << cpu;
+    uint32_t begin;
+    if (cpu == 0 || cpu >= 4) return KERN_INVALID_ARGUMENT;
+    REG(car_base, 0x340) = reset;
+    REG(flow_base, 0x14 + (cpu-1)*8) = 0;
+    io_sync();
+    if (!(REG(pmc_base, 0x38) & (1U << domain))) {
+        /* START is a command bit, not a completion indication. Boot CPUs
+         * sequentially and acknowledge each request through POWERGATE_STATUS. */
+        REG(pmc_base, 0x30) = 0x100 | domain;
+        io_sync();
+        begin = REG(timer_base, 0x10);
+        while (!(REG(pmc_base, 0x38) & (1U << domain)))
+            if ((uint32_t)(REG(timer_base, 0x10)-begin) > 100000) {
+                kprintf("[smp] CPU%u power timeout status=0x%x toggle=0x%x\n", cpu,
+                    REG(pmc_base, 0x38), REG(pmc_base, 0x30));
+                return KERN_FAILURE;
+            }
+    }
+    REG(car_base, 0x4c) &= ~(1U << (8+cpu));
+    io_sync();
+    begin = REG(timer_base, 0x10);
+    while ((uint32_t)(REG(timer_base, 0x10)-begin) < 10) {}
+    REG(pmc_base, 0x34) = 1U << domain;
+    io_sync();
+    begin = REG(timer_base, 0x10);
+    while ((uint32_t)(REG(timer_base, 0x10)-begin) < 10) {}
+    REG(evp_base, 0x100) = entry;
+    io_sync();
+    if (REG(evp_base, 0x100) != entry) panic("Tegra30 reset vector is locked");
+    REG(flow_base, 0x18 + (cpu-1)*8) = 0;
+    REG(car_base, 0x344) = reset;
+    io_sync();
+    return KERN_SUCCESS;
+}
+
 void PE_init_SocSupport_stub(void)
 {
     gPESocDispatch.uart_getc = tegra_getc;
@@ -249,6 +335,6 @@ void PE_init_SocSupport_stub(void)
     gPESocDispatch.timer_enabled = tegra_timer_enabled;
     gPESocDispatch.framebuffer_init = tegra_framebuffer_init;
     tegra30_uart_init();
-    PE_early_puts("Tegra30 Nexus7: serial/GIC/TIMER1, boot CPU only\n");
+    PE_early_puts("Tegra30 Nexus7: serial/GIC/TIMER1, Cortex-A9 SMP\n");
 }
 #endif

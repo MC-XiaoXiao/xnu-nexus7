@@ -68,3 +68,6 @@ osfmk/kdp/ml/arm/kdp_arm_common.c      optional        mach_kdp
 osfmk/kdp/ml/arm/kdp_machdep.c         optional        mach_kdp
 osfmk/kdp/ml/arm/kdp_vm.c              optional        mach_kdp
 
+
+osfmk/arm/smp.c standard
+osfmk/arm/secondary.s optional tegra30_smp
