@@ -1119,6 +1119,25 @@ ipc_kmsg_prealloc(mach_msg_size_t size)
  *		MACH_SEND_INVALID_DATA	Couldn't copy message data.
  */
 
+/* Kernel-task servers (including the BSD exception server) use kernel
+ * buffers with this name-based IPC API. Preserve copyio's user-range checks
+ * for user maps, and use the map-aware copy only for the kernel map. */
+static int
+ipc_kmsg_copyin_bytes(mach_vm_address_t address, void *bytes, vm_size_t size)
+{
+    if (current_map() == kernel_map)
+        return copyinmap(kernel_map, address, bytes, size) != KERN_SUCCESS;
+    return copyinmsg(address, bytes, size);
+}
+
+static int
+ipc_kmsg_copyout_bytes(const void *bytes, mach_vm_address_t address, vm_size_t size)
+{
+    if (current_map() == kernel_map)
+        return copyoutmap(kernel_map, (void *)bytes, address, size) != KERN_SUCCESS;
+    return copyoutmsg(bytes, address, size);
+}
+
 mach_msg_return_t
 ipc_kmsg_get(
 	mach_vm_address_t	msg_addr,
@@ -1143,7 +1162,7 @@ ipc_kmsg_get(
 	else
 		len_copied = sizeof(mach_msg_legacy_base_t);
 
-	if (copyinmsg(msg_addr, (char *)&legacy_base, len_copied))
+	if (ipc_kmsg_copyin_bytes(msg_addr, (char *)&legacy_base, len_copied))
 		return MACH_SEND_INVALID_DATA;
 
 	msg_addr += sizeof(legacy_base.header);
@@ -1183,7 +1202,7 @@ ipc_kmsg_get(
 							 kmsg->ikm_header->msgh_reserved,
 							 kmsg->ikm_header->msgh_id);
 
-	if (copyinmsg(msg_addr, (char *)(kmsg->ikm_header + 1), size - (mach_msg_size_t)sizeof(mach_msg_header_t))) {
+	if (ipc_kmsg_copyin_bytes(msg_addr, (char *)(kmsg->ikm_header + 1), size - (mach_msg_size_t)sizeof(mach_msg_header_t))) {
 		ipc_kmsg_free(kmsg);
 		return MACH_SEND_INVALID_DATA;
 	}
@@ -1516,7 +1535,7 @@ ipc_kmsg_put(
 		}
 		kprintf("type: %d\n", ((mach_msg_type_descriptor_t *)(((mach_msg_base_t *)kmsg->ikm_header)+1))->type);
 	}
-	if (copyoutmsg((const char *) kmsg->ikm_header, msg_addr, size))
+	if (ipc_kmsg_copyout_bytes((const char *) kmsg->ikm_header, msg_addr, size))
 		mr = MACH_RCV_INVALID_DATA;
 	else
 		mr = MACH_MSG_SUCCESS;

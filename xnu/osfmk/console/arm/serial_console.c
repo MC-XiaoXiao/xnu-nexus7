@@ -198,6 +198,15 @@ _cnputc(char c)
 	cons_ops[cons_ops_index].putc(0, 0, c);
 	if (c == '\n')
             cons_ops[cons_ops_index].putc(0, 0, '\r');
+	/* serial bit 2 mirrors the selected console to the other output.
+	 * serial=6 keeps video selected, enables UART input, and mirrors to UART.
+	 * Modes 0..3 keep their existing routing and panic-console behavior. */
+	if (serialmode & 4) {
+		unsigned int other = cons_ops_index == SERIAL_CONS_OPS ? VC_CONS_OPS : SERIAL_CONS_OPS;
+		cons_ops[other].putc(0, 0, c);
+		if (c == '\n')
+			cons_ops[other].putc(0, 0, '\r');
+	}
 }
 
 void cnputc_unbuffered(char c) {

@@ -55,6 +55,7 @@ typedef enum {
 	PSPA_SPECIAL = 0,
 	PSPA_EXCEPTION = 1,
 	PSPA_AU_SESSION = 2,
+	PSPA_IMP_WATCHPORTS = 3,
 } pspa_t;
 
 /*

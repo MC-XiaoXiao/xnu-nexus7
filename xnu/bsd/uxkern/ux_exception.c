@@ -184,7 +184,7 @@ ux_handler(void)
 	else if (result == MACH_RCV_TOO_LARGE)
 		/* ignore oversized messages */;
 	else
-		panic("exception_handler");
+		panic("exception_handler: mach_msg_receive returned 0x%x", result);
     }
 }
 

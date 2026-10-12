@@ -275,7 +275,7 @@ ios7leo_installd_fault(thread_t thread, const abort_information_context_t *ctx,
 #include "IOS7LeoAppFault057.h"
 #endif
 
-static int __abort_count = 0;
+static unsigned int bootstrap_abort_count;
 void sleh_abort(void *context, int reason)
 {
 #if BOARD_CONFIG_QSD8250_LEO
@@ -295,6 +295,7 @@ void sleh_abort(void *context, int reason)
     abort_information_context_t *arm_ctx =
         (abort_information_context_t *) context;
     thread_t thread = current_thread();
+    unsigned int *abort_count = thread ? &thread->machine.abort_depth : &bootstrap_abort_count;
 
     /*
      * Make sure we get the correct registers only if required.
@@ -324,10 +325,10 @@ void sleh_abort(void *context, int reason)
     /*
      * We do not want anything entering sleh_abort recursively.
      */
-    if (__abort_count != 0) {
+    if ((*abort_count) != 0) {
         sleh_fatal_exception(arm_ctx, "sleh_abort: recursive abort");
     }
-    __abort_count++;
+    (*abort_count)++;
 
     /*
      * Panic if it's an alignment fault?
@@ -377,7 +378,7 @@ void sleh_abort(void *context, int reason)
                 /*
                  * Attempt to fault the page.
                  */
-                __abort_count--;
+                (*abort_count)--;
                 code =
                     vm_fault(map, vm_map_trunc_page(arm_ctx->pc),
                              (VM_PROT_EXECUTE | VM_PROT_READ), FALSE,
@@ -422,7 +423,7 @@ void sleh_abort(void *context, int reason)
                 /*
                  * Attempt to fault the page.
                  */
-                __abort_count--;
+                (*abort_count)--;
                 code =
                     vm_fault(map, vm_map_trunc_page(dfar),
                              (dfsr & 0x800) ? (VM_PROT_READ | VM_PROT_WRITE)
@@ -506,7 +507,7 @@ void sleh_abort(void *context, int reason)
                  * Attempt to fault the page.
                  */
                 assert(get_preemption_level() == 0);
-                __abort_count--;
+                (*abort_count)--;
                 code =
                     vm_fault(map, vm_map_trunc_page(arm_ctx->pc),
                              (VM_PROT_EXECUTE | VM_PROT_READ), FALSE,
@@ -594,7 +595,7 @@ void sleh_abort(void *context, int reason)
                  * Attempt to fault the page.
                  */
                 assert(get_preemption_level() == 0);
-                __abort_count--;
+                (*abort_count)--;
                 code =
                     vm_fault(map, vm_map_trunc_page(dfar),
                              (dfsr & 0x800) ? (VM_PROT_READ | VM_PROT_WRITE)

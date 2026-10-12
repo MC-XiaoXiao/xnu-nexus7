@@ -1500,6 +1500,13 @@ exec_handle_port_actions(struct image_params *imgp, short psa_flags)
 			ret = audit_session_spawnjoin(p, port);
 			break;
 #endif
+		case PSPA_IMP_WATCHPORTS:
+			/* iOS 6 launchd supplies these even for interactive daemons.
+			 * Match Apple's non-adaptive spawn path: validate COPY_SEND
+			 * above, then release it. This kernel has no importance-watch
+			 * machinery, so it cannot donate priority to adaptive tasks. */
+			ipc_port_release_send(port);
+			break;
 		default:
 			ret = EINVAL;
 			break;
@@ -1879,6 +1886,14 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
 			if ((error = copyin(px_args.port_actions, px_spap, 
 							px_args.port_actions_size)) != 0)
 				goto bad;
+
+			/* Do not let a user count walk past the copied action block. */
+			if (px_spap->pspa_count < 0 ||
+			    (unsigned)px_spap->pspa_count >
+			    (px_args.port_actions_size - PS_PORT_ACTIONS_SIZE(0)) / sizeof(_ps_port_action_t)) {
+				error = EINVAL;
+				goto bad;
+			}
 		}
 	}
 

@@ -167,6 +167,7 @@ kern_return_t machine_thread_create(thread_t thread, task_t task)
      * Set the members now.
      */
     thread->machine.preempt_count = 0;
+    thread->machine.abort_depth = 0;
     thread->machine.cpu_data = cpu_datap(cpu_number());
     thread->machine.vfp_enable = 0;
     thread->machine.vfp_dirty = 0;

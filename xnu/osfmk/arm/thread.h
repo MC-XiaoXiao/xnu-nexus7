@@ -82,6 +82,7 @@ struct machine_thread {
 #ifdef	MACH_BSD
     uint64_t cthread_self;      /* for use of cthread package  */
 #endif
+    unsigned int abort_depth; /* Recursion belongs to the faulting thread. */
 };
 typedef struct machine_thread *pcb_t;
 
