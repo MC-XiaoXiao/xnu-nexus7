@@ -34,6 +34,13 @@
         };
     };
     arm-io {
+        touch {
+            compatible = "nvidia,tegra30-elan-touch";
+            /* I2C2, CAR, GPIO, pinmux. PH4 is polled by an IOKit timer. */
+            reg = <0x7000c400 0x100 0x60006000 0x1000
+                   0x6000d000 0x1000 0x70003000 0x400>;
+            TouchPanelProfile = "asus,grouper-elan-ktf3k";
+        };
         pmc {
             compatible = "nvidia,tegra30-pmc";
             reg = <0x7000e400 0x400>;
