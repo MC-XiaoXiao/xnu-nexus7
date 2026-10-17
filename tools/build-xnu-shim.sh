@@ -22,7 +22,7 @@ if [[ -n ${SHIM_UART_PHYS:-} ]]; then
         echo 'SHIM_UART_PHYS must be UARTA 0x70006000 or UARTD 0x70006300' >&2; exit 1; }
     flags+=("-DSHIM_UART_PHYS=$SHIM_UART_PHYS")
 fi
-python3 "$root/tools/build-device-tree.py" --board "$root/boot/device-tree/$platform.dts" \
+python3 "$root/tools/build-device-tree.py" --board "${SHIM_BOARD:-$root/boot/device-tree/$platform.dts}" \
     --uart "${SHIM_UART_PHYS:-$([[ $platform == nexus7 ]] && echo 0x70006000 || echo 0x09000000)}" --out "$out/xnu-device-tree.adt"
 "$cc" -E -P -x c -DSHIM_LINK_ADDRESS="$address" "$src/linker.ld.S" -o "$out/linker.ld"
 objects=()

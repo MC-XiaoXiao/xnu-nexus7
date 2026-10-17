@@ -96,6 +96,10 @@ const char * gIOKernelConfigTables =
 ",{ 'IOClass' = Tegra30Watchdog; 'IOProviderClass' = AppleARMIODevice;"
 "   'IONameMatch' = 'nvidia,tegra30-watchdog'; }"
 #endif
+#if defined(TEGRA30_USB)
+",{ 'IOClass' = Tegra30USB; 'IOProviderClass' = AppleARMIODevice;"
+"   'IONameMatch' = 'nvidia,tegra30-usb-device'; }"
+#endif
 #if defined(TEGRA30_TOUCH) && defined(APPLE_HID_TOUCH)
 ",{ 'IOClass' = Tegra30Touch; 'IOProviderClass' = AppleARMIODevice;"
 "   'IONameMatch' = 'nvidia,tegra30-elan-touch'; }"

@@ -53,7 +53,7 @@ def main():
         p.error('bootargs must be <=255 safe ASCII characters')
     kernel=a.kernel.read_bytes(); shim=a.shim.read_bytes()
     tree=(a.device_tree or a.shim.parent/'xnu-device-tree.adt').read_bytes()
-    if not 0<len(tree)<=4096: p.error('invalid Apple DT size')
+    if not 0<len(tree)<=8192: p.error('invalid Apple DT size')
     if not (28<=len(kernel)<=0x2000000) or struct.unpack_from('<4I',kernel)!=(0xfeedface,12,9,2):
         p.error('expected a <=32 MiB ARMv7 Mach-O kernel')
     if not (0<len(shim)<=0x20000): p.error('shim exceeds its reservation')

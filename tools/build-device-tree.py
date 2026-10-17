@@ -22,8 +22,8 @@ def build(board, uart=None):
         subprocess.run([*flags,str(Path(board).resolve()),'-o',str(source)],check=True)
         subprocess.run([compiler,'-I','dts','-O','dtb','-o',str(output),str(source)],check=True)
         blob=output.read_bytes()
-    if not 8 <= len(blob) <= 4096 or blob[:4]==b'\xd0\x0d\xfe\xed':
-        raise ValueError('expected Apple DT, <=4096 bytes; use the modified Apple dtc')
+    if not 8 <= len(blob) <= 8192 or blob[:4]==b'\xd0\x0d\xfe\xed':
+        raise ValueError('expected Apple DT, <=8192 bytes; use the modified Apple dtc')
     return blob
 
 def main():

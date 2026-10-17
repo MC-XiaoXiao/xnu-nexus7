@@ -21,6 +21,7 @@ options		NO_KEXTD				# <no_kextd>
 options CONFIG_EMBEDDED
 
 options TEGRA30_EMMC
+options TEGRA30_USB
 options APPLE_HID_TOUCH
 options TEGRA30_TOUCH
 options TEGRA30_WATCHDOG

@@ -6,7 +6,7 @@
 #include <stdbool.h>
 #define SHIM_MAX_SEGMENTS 32
 #define SHIM_CMDLINE_SIZE 256
-#define SHIM_DT_SIZE 4096
+#define SHIM_DT_SIZE 8192
 #define SHIM_VM_RESERVE 0x200000U
 struct shim_range { uint32_t base, size; };
 struct macho_segment { uint32_t va, pa, memsz, offset, filesz, prot; };
@@ -50,6 +50,7 @@ bool macho_load(const void *, const struct macho_plan *, shim_map_fn, void *);
 const char *xnu_layout(const struct macho_plan *, const struct shim_policy *, struct xnu_layout *);
 const char *xnu_build_args(shim_boot_args *, const struct shim_policy *, const struct xnu_layout *, uint32_t dt_size, const char *command);
 const char *xnu_prepare_tree(void *, size_t, size_t *, const void *, size_t, const struct shim_identity *, const struct shim_policy *, const struct macho_plan *, const struct xnu_layout *);
+bool shim_dt_compatible(const unsigned char *, uint32_t, const char *);
 void *memcpy(void *, const void *, size_t);
 void *memset(void *, int, size_t);
 size_t shim_strlen(const char *, size_t);

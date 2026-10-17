@@ -48,6 +48,10 @@ iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/leo_sdcc.c standard
 iokit/Drivers/KernelBuiltIn/ARM/AppleARMPlatform/fat_locator.c standard
 
 # Tegra30 SoC drivers
+iokit/Drivers/KernelBuiltIn/ARM/Tegra30/Tegra30USB.cpp optional iokitcpp tegra30_usb
+iokit/Drivers/KernelBuiltIn/ARM/Tegra30/USBDeviceFamily.cpp optional iokitcpp tegra30_usb
+iokit/Drivers/KernelBuiltIn/ARM/Tegra30/USBDeviceUserClient.cpp optional iokitcpp tegra30_usb
+iokit/Drivers/KernelBuiltIn/ARM/Tegra30/USBDeviceMux.cpp optional iokitcpp tegra30_usb
 iokit/Drivers/KernelBuiltIn/ARM/AppleHIDTouch/IOHIDEvent.cpp optional iokitcpp apple_hid_touch
 iokit/Drivers/KernelBuiltIn/ARM/AppleHIDTouch/IOHIDEventService.cpp optional iokitcpp apple_hid_touch
 iokit/Drivers/KernelBuiltIn/ARM/AppleHIDTouch/IOHIDEventServiceQueue.cpp optional iokitcpp apple_hid_touch

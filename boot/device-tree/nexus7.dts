@@ -34,6 +34,14 @@
         };
     };
     arm-io {
+        usb-device {
+            compatible = "nvidia,tegra30-usb-device";
+            reg = <0x7d000000 0x1000 0x60006000 0x1000>;
+            interrupt-parent = <&gic>;
+            /* USB1 SPI 20 + 32, device-capable UTMI controller. */
+            interrupts = <52>;
+            clock-frequency = <12000000>;
+        };
         touch {
             compatible = "nvidia,tegra30-elan-touch";
             /* I2C2, CAR, GPIO, pinmux. PH4 is polled by an IOKit timer. */
